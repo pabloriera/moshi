@@ -94,14 +94,14 @@ WebSocket, CUDA, or out-of-memory errors.
 
 ### Hidden-state trajectory experiments
 
-The **Hidden-state trajectories** panel above the onset plots adds a seeded cyclic
+The **Desviá.** module (code `TRAJ`) in the bottom control deck adds a seeded cyclic
 trajectory to the residual hidden state **after a selected temporal-transformer
 block**, before text prediction and audio-depth generation. It is an inference
 experiment, not a model-training change or an audio effect applied afterwards.
 
-- **Perturbation ON/OFF**: enable or immediately bypass injection. It starts OFF after
+- **ON** switch: enable or immediately bypass injection. It starts OFF after
   a browser reload; the other settings and MIDI mappings are saved locally.
-- **Trajectory** chooses one of three presets:
+- **TRAJ** keys (`ORB`, `PUL`, `WLK`) choose one of three presets:
   - **Smooth orbit**: the original closed Fourier trajectory in seeded random
     directions, not independently sampled noise each frame.
   - **Cycle-start pulse**: a fixed seeded unit-RMS vector is injected for only
@@ -113,44 +113,43 @@ experiment, not a model-training change or an audio effect applied afterwards.
     seeded random-direction increment each model frame, then jump back to the
     first vector at the next cycle. The same direction sequence repeats each
     cycle; rate changes preserve phase and the current walk position until
-    the next boundary. **Walk step** sets each increment's RMS (0–1) before
+    the next boundary. **STEP** (walk step) sets each increment's RMS (0–1) before
     overall strength; zero holds the first vector. Drift accumulates, so longer
     cycles and larger steps can produce much larger perturbations.
-  Preset selection and Walk step support MIDI learn; the selector uses CC
+  Preset selection and STEP support MIDI learn; the selector uses CC
   0–42 for orbit, 43–84 for pulse, and 85–127 for walk. The selected preset,
   its settings, and MIDI mappings survive browser reloads (injection starts OFF).
-- **Strength**: overall trajectory gain relative to that frame's hidden-state RMS,
+- **STR** (strength): overall trajectory gain relative to that frame's hidden-state RMS,
   from 0 (exact bypass) to 10. Start around 0.05–0.2; large values can produce
   incoherent speech, silence, or unstable sounds. Strength ramps over about
   150 ms for orbit/walk, except OFF/zero, which bypass immediately. Pulse uses
   the full chosen strength immediately at each kick. Its base vector and the
   smooth orbit have unit RMS; the walk's magnitude varies as steps accumulate.
-- **Cycle rate**: 0.01–6 Hz (100–0.167 seconds per orbit). Phase advances with model
+- **RATE** (cycle rate): 0.01–6 Hz (100–0.167 seconds per orbit). Phase advances with model
   frames, including silent input, not a separate wall-clock timer. Rate changes
   keep phase continuous; if inference stops, phase stops too.
-  The phase bar receives one update per inference step (12.5 updates/second
+  The phase ring in the module heading receives one update per inference step (12.5 updates/second
   at real-time speed), including startup steps before output audio is available.
   Its marker is interpolated at the browser animation rate with up to one
   model step of display lag, rather than snapping between packets. Cycle wraps
   are interpolated forward; the display stops at the last received phase if
   inference pauses. This visual smoothing does not alter the model clock.
-- **Layer**: one-based transformer block index. **Harmonics** (smooth orbit only): 1–6 Fourier
+- **LAYER**: one-based transformer block index. **HARM** (harmonics, smooth orbit only): 1–6 Fourier
   harmonics in seeded random orthonormal directions (a 2–12 dimensional
   subspace of the full hidden-state space). The direction repeats exactly;
   its magnitude follows the current activation RMS. Higher harmonics can
   exceed the model-frame Nyquist frequency and alias, intentionally permitting
   more irregular experimental motion at fast cycle rates.
-- **New path** changes the seed/directions without resetting phase.
-  **Phase ↺** restarts only the trajectory, not the conversation. Preset changes
+- **New path** (the dice key in the module heading) changes the seed/directions
+  without resetting phase. **Phase ↺** (the arrow key beside it) restarts only the trajectory, not the conversation. Preset changes
   also preserve phase and context. Layer/path/preset changes
   can introduce abrupt changes; strength/rate modulation is smoother.
 
 All controls apply on upcoming model steps without clearing KV caches or
 recapturing CUDA graphs. Turning injection off does not undo effects already
-stored in the conversation; use **Clear model context** for a fresh baseline
-(trajectory settings are preserved, but its phase is reset). Both this panel and the
-onset plots are independently foldable by clicking their headings; folding them
-does not stop inference or onset recording.
+stored in the conversation; use **FLUSH** (in **Olvidá.**) for a fresh baseline
+(trajectory settings are preserved, but its phase is reset). Every control's full
+explanation is in its tooltip; knobs take Shift + drag for fine adjustment.
 
 The forcing is periodic, but generated sound need not be: autoregressive
 context and sampling can respond non-periodically. Implementation:

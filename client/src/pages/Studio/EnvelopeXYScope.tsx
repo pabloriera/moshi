@@ -1,4 +1,6 @@
-import { FC, useEffect, useRef } from "react";
+import { FC, useEffect, useId, useRef } from "react";
+
+const INK = "rgba(35, 34, 31, ALPHA)";
 
 type EnvelopeXYScopeProps = {
   inputAnalyser: AnalyserNode | null;
@@ -22,11 +24,19 @@ function normalizeEnvelope(rms: number) {
   return Math.min(1, Math.log1p(rms * 40) / Math.log(5));
 }
 
+const PARALLELS = [32, 68, 110, 152, 188];
+const MERIDIAN_DELAYS = [0, -3.5, -7, -10.5];
+
+/**
+ * Input envelope (x) against Moshi envelope (y), drawn over a wire-frame globe
+ * that turns frame by frame, as in the Röhner page with the sphere.
+ */
 export const EnvelopeXYScope: FC<EnvelopeXYScopeProps> = ({
   inputAnalyser,
   outputAnalyser,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const clipId = `xy-globe-${useId().replace(/:/g, "")}`;
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -54,20 +64,8 @@ export const EnvelopeXYScope: FC<EnvelopeXYScopeProps> = ({
     resize();
 
     const draw = (timestamp: number) => {
-      const width = canvas.clientWidth;
-      const height = canvas.clientHeight;
-      context.clearRect(0, 0, width, height);
-      context.fillStyle = "#0b0f10";
-      context.fillRect(0, 0, width, height);
-
-      context.strokeStyle = "#252c2f";
-      context.lineWidth = 1;
-      context.beginPath();
-      context.moveTo(width / 2, 0);
-      context.lineTo(width / 2, height);
-      context.moveTo(0, height / 2);
-      context.lineTo(width, height / 2);
-      context.stroke();
+      const size = canvas.clientWidth;
+      context.clearRect(0, 0, size, size);
 
       if (timestamp - lastSample >= 32) {
         const input = normalizeEnvelope(analyserRms(inputAnalyser, inputSamples));
@@ -79,25 +77,34 @@ export const EnvelopeXYScope: FC<EnvelopeXYScopeProps> = ({
         lastSample = timestamp;
       }
 
+      const centre = size / 2;
+      const radius = size / 2 - 10;
+      const toCanvas = (point: Point) => ({
+        x: centre + (point.x * 2 - 1) * radius * 0.82,
+        y: centre - (point.y * 2 - 1) * radius * 0.82,
+      });
+
       if (points.length > 1) {
-        context.lineWidth = 1;
+        context.lineCap = "round";
+        context.lineJoin = "round";
         points.slice(1).forEach((point, index) => {
-          const previous = points[index];
-          const opacity = (index + 1) / points.length;
-          context.strokeStyle = `rgba(34, 211, 166, ${0.08 + opacity * 0.75})`;
+          const from = toCanvas(points[index]);
+          const to = toCanvas(point);
+          const strength = (index + 1) / points.length;
+          context.strokeStyle = INK.replace("ALPHA", (0.1 + strength * 0.9).toFixed(2));
+          context.lineWidth = 1 + strength * 2;
           context.beginPath();
-          context.moveTo(4 + previous.x * (width - 8), height - 4 - previous.y * (height - 8));
-          context.lineTo(4 + point.x * (width - 8), height - 4 - point.y * (height - 8));
+          context.moveTo(from.x, from.y);
+          context.lineTo(to.x, to.y);
           context.stroke();
         });
+        const head = toCanvas(points[points.length - 1]);
+        context.fillStyle = INK.replace("ALPHA", "1");
+        context.beginPath();
+        context.arc(head.x, head.y, 5, 0, Math.PI * 2);
+        context.fill();
       }
 
-      context.fillStyle = "#5d686e";
-      context.font = "7px IBM Plex Mono, monospace";
-      context.fillText("OUT", 4, 9);
-      context.textAlign = "right";
-      context.fillText("IN", width - 4, height - 4);
-      context.textAlign = "left";
       animationFrame = requestAnimationFrame(draw);
     };
 
@@ -109,8 +116,37 @@ export const EnvelopeXYScope: FC<EnvelopeXYScopeProps> = ({
   }, [inputAnalyser, outputAnalyser]);
 
   return (
-    <div className="xy-scope">
-      <canvas ref={canvasRef} aria-label="Input versus Moshi output envelope XY scope" />
+    <div className="xy-globe">
+      <svg viewBox="0 0 220 220" aria-hidden="true">
+        <defs>
+          <clipPath id={clipId}>
+            <circle cx="110" cy="110" r="104" />
+          </clipPath>
+        </defs>
+        <circle cx="110" cy="110" r="106" className="xy-globe-disc" />
+        <g clipPath={`url(#${clipId})`}>
+          <g transform="rotate(-16 110 110)">
+            {MERIDIAN_DELAYS.map((delay) => (
+              <ellipse
+                key={delay}
+                className="xy-globe-meridian"
+                cx="110"
+                cy="110"
+                rx="104"
+                ry="104"
+                style={{ animationDelay: `${delay}s` }}
+              />
+            ))}
+            {PARALLELS.map((y) => (
+              <line key={y} className="xy-globe-line" x1="0" y1={y} x2="220" y2={y} />
+            ))}
+          </g>
+        </g>
+        <circle cx="110" cy="110" r="106" className="xy-globe-rim" />
+      </svg>
+      <canvas ref={canvasRef} aria-label="Envolvente de entrada contra envolvente de Moshi" />
+      <span className="xy-tag xy-tag-out">OUT</span>
+      <span className="xy-tag xy-tag-in">IN</span>
     </div>
   );
 };

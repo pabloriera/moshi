@@ -2,7 +2,9 @@ import Recorder from "opus-recorder";
 import encoderPath from "opus-recorder/dist/encoderWorker.min.js?url";
 import {
   ChangeEvent,
+  CSSProperties,
   FC,
+  ReactNode,
   useCallback,
   useEffect,
   useMemo,
@@ -13,8 +15,6 @@ import { decodeMessage, encodeMessage } from "../../protocol/encoder";
 import { WSMessage } from "../../protocol/types";
 import { AudioScope } from "./AudioScope";
 import { EnvelopeXYScope } from "./EnvelopeXYScope";
-import { InfoTip } from "./InfoTip";
-import { OnsetAnalysis } from "./OnsetAnalysis";
 import { PhaseClock } from "./PhaseClock";
 import { PhaseIndicator } from "./PhaseIndicator";
 
@@ -260,7 +260,7 @@ export const Studio: FC = () => {
   const [crossOnsetDeltas, setCrossOnsetDeltas] = useState<number[]>([]);
   const [onsetElapsed, setOnsetElapsed] = useState(0);
   const [histogramRange, setHistogramRange] = useState(5);
-  const [histogramBins, setHistogramBins] = useState(12);
+  const [histogramBins, setHistogramBins] = useState(8);
   const [midiMappings, setMidiMappings] = useState<Record<string, MidiMapping>>(loadMidiMappings);
   const [midiLearning, setMidiLearning] = useState<string | null>(null);
   const [midiState, setMidiState] = useState<"idle" | "requesting" | "ready" | "error">("idle");
@@ -1145,12 +1145,45 @@ export const Studio: FC = () => {
     send({ type: "control", action: "restart" });
   }, [send]);
 
+  const [draining, setDraining] = useState(false);
+  const drainTimerRef = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (drainTimerRef.current) window.clearTimeout(drainTimerRef.current);
+  }, []);
+
+  // The monologue goes down the drain (a few stepped frames) before it is cleared.
+  const drainThen = useCallback((action: () => void) => {
+    if (drainTimerRef.current) window.clearTimeout(drainTimerRef.current);
+    setDraining(true);
+    drainTimerRef.current = window.setTimeout(() => {
+      action();
+      setDraining(false);
+      drainTimerRef.current = null;
+    }, 720);
+  }, []);
+
+  const resetDefaults = useCallback(() => {
+    setParams(DEFAULT_PARAMS);
+    paramsRef.current = DEFAULT_PARAMS;
+    sendSamplingParams(DEFAULT_PARAMS);
+    localStorage.setItem("moshi-studio-params", JSON.stringify(DEFAULT_PARAMS));
+  }, [sendSamplingParams]);
+
   const statusTone = connection === "live" ? "live" : connection === "connecting" ? "waiting" : "offline";
+  const connectionLabel = connection === "live"
+    ? "LIVE"
+    : connection === "connecting" ? "WAIT" : connection === "busy" ? "BUSY" : "OFF";
+  const activePad = SOUND_PADS.find((pad) => pad.id === selectedPadId);
+  const frameRate = perturbationStatus?.frame_rate ?? 12.5;
+  const midiLabel = midiState === "ready"
+    ? `MIDI: ${midiDevices.length} entrada${midiDevices.length === 1 ? "" : "s"}`
+    : midiState === "requesting" ? "MIDI: esperando permiso" : midiState === "error" ? "MIDI: reintentar" : "Activar MIDI";
   const sourceLabel = useMemo(() => {
-    if (!sourceActive) return "Input idle";
-    if (inputMode === "sample") return looping ? `${triggerRate.toFixed(2)} triggers / sec` : "Sample armed";
-    return inputMode === "microphone" ? "Microphone active" : "System stream active";
-  }, [inputMode, looping, sourceActive, triggerRate]);
+    if (inputMode !== "sample") return sourceActive ? "en vivo" : "inactivo";
+    const name = activePad?.label ?? (sampleName ? "sample" : "sin sample");
+    return looping ? `${triggerRate.toFixed(2)} Hz · ${name}` : name;
+  }, [activePad, inputMode, looping, sampleName, sourceActive, triggerRate]);
+
   const midiControlProps = (target: string) => ({
     midiKey: target,
     midiLearning: midiLearning === target,
@@ -1172,419 +1205,716 @@ export const Studio: FC = () => {
     void beginMidiLearn("voice-pad-0");
   };
 
+  // Past lines above, present line below; repeated sentences are marked in pencil.
+  const monologue = useMemo(() => {
+    const clean = transcript.replace(/\s+/g, " ").trim();
+    if (!clean) return { history: [] as string[], current: [] as { text: string; repeated: boolean }[] };
+    const sentences = clean.match(/[^.!?…]+[.!?…]+|[^.!?…]+$/g)?.map((part) => part.trim()).filter(Boolean) ?? [clean];
+    const clip = (text: string, size: number) => (text.length > size ? `…${text.slice(-size)}` : text);
+    const current: string[] = [];
+    let budget = CURRENT_LINE_BUDGET;
+    for (let index = sentences.length - 1; index >= 0; index -= 1) {
+      const sentence = sentences[index];
+      if (current.length && sentence.length > budget) break;
+      current.unshift(clip(sentence, CURRENT_LINE_BUDGET));
+      budget -= sentence.length;
+      if (budget <= 0) break;
+    }
+    const history = sentences
+      .slice(Math.max(0, sentences.length - current.length - HISTORY_LINES), sentences.length - current.length)
+      .map((sentence) => clip(sentence, 72));
+    const normalize = (text: string) => text.toLocaleLowerCase().normalize("NFKC").replace(/[^\p{L}\p{N}]+/gu, "");
+    const counts = new Map<string, number>();
+    current.forEach((text) => counts.set(normalize(text), (counts.get(normalize(text)) ?? 0) + 1));
+    return {
+      history,
+      current: current.map((text) => ({ text, repeated: (counts.get(normalize(text)) ?? 0) > 1 })),
+    };
+  }, [transcript]);
+
+  // Onset strip under the monologue: rolling window, one onset time per row.
+  const raster = useMemo(() => {
+    const windowEnd = Math.max(RASTER_WINDOW_SECONDS, onsetElapsed);
+    const windowStart = windowEnd - RASTER_WINDOW_SECONDS;
+    const toX = (time: number) => ((time - windowStart) / RASTER_WINDOW_SECONDS) * 100;
+    const visible = (times: number[]) => times.filter((time) => time >= windowStart && time <= windowEnd).map(toX);
+    let latency: number | null = null;
+    for (let index = inputOnsets.length - 1; index >= 0 && latency === null; index -= 1) {
+      const start = inputOnsets[index];
+      const end = inputOnsets[index + 1] ?? Infinity;
+      const reply = outputOnsets.find((time) => time >= start && time < end);
+      if (reply !== undefined) latency = reply - start;
+    }
+    const meanDelta = crossOnsetDeltas.length
+      ? crossOnsetDeltas.reduce((total, value) => total + value, 0) / crossOnsetDeltas.length
+      : null;
+    return {
+      windowStart,
+      inputs: visible(inputOnsets),
+      outputs: visible(outputOnsets),
+      lastIn: inputOnsets.length ? `${inputOnsets[inputOnsets.length - 1].toFixed(2)}s` : "—",
+      latency: latency === null ? "—" : `${latency.toFixed(2)}s`,
+      meanDelta: meanDelta === null ? "sin datos" : `${meanDelta.toFixed(2)} s`,
+    };
+  }, [crossOnsetDeltas, inputOnsets, onsetElapsed, outputOnsets]);
+
+  const histogram = useMemo(() => {
+    const count = Math.round(histogramBins);
+    const fill = (onsets: number[]) => {
+      const bins = Array<number>(count).fill(0);
+      onsets.slice(1).forEach((onset, index) => {
+        const interval = onset - onsets[index];
+        if (interval < 0 || interval > histogramRange) return;
+        bins[Math.min(count - 1, Math.floor((interval / histogramRange) * count))] += 1;
+      });
+      return bins;
+    };
+    const inputs = fill(inputOnsets);
+    const outputs = fill(outputOnsets);
+    const peak = Math.max(1, ...inputs, ...outputs);
+    // Last input onset minus last Moshi onset, from −range to +range around zero.
+    const deltas = Array<number>(count).fill(0);
+    crossOnsetDeltas.forEach((delta) => {
+      if (delta < -histogramRange || delta > histogramRange) return;
+      const position = (delta + histogramRange) / (histogramRange * 2);
+      deltas[Math.min(count - 1, Math.floor(position * count))] += 1;
+    });
+    const deltaPeak = Math.max(1, ...deltas);
+    return {
+      intervals: inputs.map((value, index) => ({
+        inH: (value / peak) * 100,
+        outH: (outputs[index] / peak) * 100,
+      })),
+      deltas: deltas.map((value) => (value / deltaPeak) * 100),
+      inCount: inputOnsets.length,
+      outCount: outputOnsets.length,
+      deltaCount: crossOnsetDeltas.length,
+    };
+  }, [crossOnsetDeltas, histogramBins, histogramRange, inputOnsets, outputOnsets]);
+
   return (
-    <main className="studio-shell">
-      <header className="studio-header">
-        <div className="brand-lockup">
-          <div className="brand-mark" aria-hidden="true"><span /><span /><span /></div>
-          <div>
-            <p className="eyebrow">KYUTAI AUDIO SYSTEMS</p>
-            <h1>MOSHI <span>LIVE LAB</span></h1>
+    <main className="studio">
+      <div className="studio-frame">
+        <header className="studio-header">
+          <div className="brand">
+            <strong>MOSHI_LIVE_LAB</strong>
+            <span title="Modelo cargado">{MODEL_NAME}</span>
           </div>
-        </div>
-        <div className="header-telemetry">
-          <div className={`status-pill ${statusTone}`}><i />{statusMessage}</div>
-          <div className="midi-monitor">
-            <button
-              className={`status-pill midi-access-button ${midiState === "ready" && midiDevices.length ? "live" : midiState === "error" ? "offline" : ""}`}
-              onClick={() => void enableMidi()}
-              disabled={midiState === "requesting"}
-              title={midiDevices.length ? midiDevices.join(", ") : "Connect your MIDI controller to the computer running this browser, then allow MIDI access."}
-            >
-              <i />
-              {midiState === "ready"
-                ? midiDevices.length ? `MIDI · ${midiDevices.length} input${midiDevices.length === 1 ? "" : "s"}` : "MIDI · no inputs"
-                : midiState === "requesting" ? "MIDI · allow access…"
-                  : midiState === "error" ? "MIDI · retry" : "Enable MIDI"}
-            </button>
-            <small className={midiError ? "midi-error" : ""} title={midiError || midiDevices.join(", ")}>
-              {midiError || (midiState === "ready"
-                ? lastMidiMessage || (midiDevices.length ? `${midiDevices.join(", ")} · move a control` : "Connect a controller to this computer")
-                : "Click to check devices")}
-            </small>
+          <div className="telemetry">
+            <span className={`live-pill ${statusTone}`}><i />{connectionLabel}</span>
+            <span className="status-text" title={statusMessage}>{statusMessage}</span>
+            <span title="Tiempo de sesión">{formatTime(elapsed)}</span>
+            <span title="Pasos del modelo por segundo">{frameRate} Hz</span>
+            <span title="Códec">MIMI 24K</span>
           </div>
-          <div className="session-clock"><span>SESSION</span>{formatTime(elapsed)}</div>
-          {!audioEnabled && (
-            <button className="primary-button compact" onClick={enableAudio}>Enable sound</button>
-          )}
-          {connection === "offline" && (
-            <button className="ghost-button compact" onClick={connect}>Reconnect</button>
-          )}
-        </div>
-      </header>
-
-      {!secureCapture && (
-        <div className="security-banner">
-          <span>HTTP MODE</span>
-          File samples work now. Browser microphone and system-audio capture need HTTPS or an SSH localhost tunnel.
-        </div>
-      )}
-
-      <section className="studio-grid">
-        <article className="panel input-panel">
-          <div className="panel-heading">
-            <div>
-              <p className="panel-index">01 / SOURCE</p>
-              <h2 className="title-with-help">
-                Input deck
-                <InfoTip text="Choose a built-in pad, uploaded loop, microphone, or shared system audio to feed Moshi." />
-              </h2>
-            </div>
-            <div className="input-heading-actions">
-              <div className={`activity-label ${sourceActive ? "active" : ""}`}><i />{sourceLabel}</div>
+          <div className="header-actions">
+            <div className="midi-monitor">
               <button
                 type="button"
-                className={`monitor-mute-button ${monitorMuted ? "muted" : ""}`}
-                aria-pressed={monitorMuted}
-                aria-label="Mute input monitor"
-                disabled={inputMode === "microphone"}
-                title={inputMode === "microphone"
-                  ? "Microphone monitoring is always muted to avoid feedback. Moshi plays through both speakers."
-                  : "Mute input in the speakers while continuing to feed Moshi. Moshi then plays through both speakers."}
-                onClick={() => setInputMonitorMuted((muted) => !muted)}
+                className={`key midi-key ${midiState === "ready" && midiDevices.length ? "ready" : ""} ${midiState === "error" ? "error" : ""}`}
+                onClick={() => void enableMidi()}
+                disabled={midiState === "requesting"}
+                aria-label={midiLabel}
+                title={midiState === "ready" && midiDevices.length
+                  ? `${midiDevices.join(", ")}`
+                  : midiError || "Conectá un controlador MIDI a esta computadora y permití el acceso"}
               >
-                {monitorMuted ? "Monitor muted" : "Mute monitor"}
+                <MidiGlyph />
+                <span>{midiState === "ready" ? `MIDI ${midiDevices.length}` : midiState === "requesting" ? "MIDI …" : midiState === "error" ? "MIDI !" : "MIDI"}</span>
               </button>
+              <small className={midiError ? "midi-error" : undefined} title={midiError || lastMidiMessage}>
+                {midiError || (midiState === "ready" ? lastMidiMessage || (midiDevices.length ? "mové un control" : "sin entradas") : "")}
+              </small>
             </div>
-          </div>
-
-          <div className="source-tabs" role="tablist" aria-label="Audio input source">
-            {(["sample", "microphone", "system"] as InputMode[]).map((mode) => (
-              <button
-                key={mode}
-                className={inputMode === mode ? "selected" : ""}
-                onClick={() => {
-                  stopInput();
-                  setInputMode(mode);
-                }}
-              >
-                {mode === "sample" ? "Sample loop" : mode === "microphone" ? "Microphone" : "System / loop"}
+            {!secureCapture && (
+              <span className="http-badge" title="Conexión HTTP: el micrófono y el audio del sistema necesitan HTTPS o un túnel a localhost">
+                <Icon d={ICONS.lock} size={14} />HTTP
+              </span>
+            )}
+            {connection === "offline" && (
+              <button type="button" className="key key-small" onClick={connect} aria-label="Reconectar" title="Reconectar">
+                <Icon d={ICONS.reset} size={18} />
               </button>
-            ))}
+            )}
+            <button
+              type="button"
+              className="key key-small"
+              aria-pressed={audioEnabled}
+              onClick={enableAudio}
+              aria-label={audioEnabled ? "Sonido activo" : "Activar sonido"}
+              title={audioEnabled ? "Sonido activo" : "Activar sonido"}
+            >
+              <Icon d={audioEnabled ? ICONS.speakerOn : ICONS.speakerOff} size={18} />
+            </button>
           </div>
+        </header>
 
-          <div className="scope-wrap">
-            <AudioScope analyser={inputAnalyser} color="#f97316" idleLabel="WAITING FOR INPUT" />
-            <div className="scope-meta"><span>{monitorMuted ? "INPUT MONITOR / MUTED" : "MONITOR / LEFT"}</span><span>24 kHz OPUS</span></div>
-            <div className="level-meter"><span style={{ width: `${inputLevel}%` }} /></div>
+        <section className="cell source" aria-label="Fuente">
+          <div className="caption">
+            <strong>Escuchá.</strong>
+            <span className="caption-tools">
+              <small>{sourceLabel}</small>
+              <button
+                type="button"
+                className="mini-key"
+                aria-pressed={monitorMuted}
+                disabled={inputMode === "microphone"}
+                onClick={() => setInputMonitorMuted((muted) => !muted)}
+                aria-label={monitorMuted ? "Monitor de entrada silenciado" : "Silenciar el monitor de entrada"}
+                title={inputMode === "microphone"
+                  ? "Con micrófono el monitor siempre está silenciado para evitar acople. Moshi suena por los dos parlantes"
+                  : monitorMuted
+                    ? "Monitor de entrada silenciado: Moshi sigue escuchando y suena por los dos parlantes"
+                    : "Silenciar la entrada en los parlantes sin dejar de alimentar a Moshi"}
+              >
+                <Icon d={monitorMuted ? ICONS.speakerOff : ICONS.speakerOn} size={12} />
+              </button>
+              {inputMode === "sample" && (
+                <button
+                  type="button"
+                  className={`midi-dot ${voicePadMidiLearning ? "learning" : ""} ${voicePadMidiMappedCount ? "mapped" : ""}`}
+                  aria-pressed={voicePadMidiLearning}
+                  onClick={beginVoicePadMidiLearn}
+                  aria-label={`MIDI learn de los pads (${voicePadMidiMappedCount}/${SOUND_PADS.length})`}
+                  title={`MIDI learn de los pads: ${voicePadMidiMappedCount}/${SOUND_PADS.length} asignados`}
+                >
+                  <MidiGlyph />
+                </button>
+              )}
+            </span>
           </div>
+          <div className="source-body">
+            <div className="source-tabs" role="tablist" aria-label="Fuente de entrada">
+              {SOURCES.map((source) => (
+                <button
+                  key={source.mode}
+                  type="button"
+                  role="tab"
+                  className="key"
+                  aria-selected={inputMode === source.mode}
+                  title={source.title}
+                  onClick={() => {
+                    stopInput();
+                    setInputMode(source.mode);
+                  }}
+                >
+                  <Icon d={source.icon} size={22} />
+                  <small>{source.code}</small>
+                </button>
+              ))}
+            </div>
 
-          {inputMode === "sample" ? (
-            <div className="sample-controls">
-              <div className="sound-pad-block">
-                <div className="sound-pad-heading">
-                  <span className="title-with-help">
-                    BUILT-IN VOICE PADS
-                    <InfoTip text="Press a pad with the mouse or use keys 1–9 and 0. Selection does not reset the running loop phase." />
-                  </span>
-                  <div className="sound-pad-heading-actions">
-                    <button
-                      type="button"
-                      className={`midi-learn-button ${voicePadMidiLearning ? "learning" : ""} ${voicePadMidiMappedCount ? "mapped" : ""}`}
-                      onClick={beginVoicePadMidiLearn}
-                      title={voicePadMidiLearning
-                        ? "Learning voice pads from first to last; click to cancel"
-                        : `MIDI learn voice pads (${voicePadMidiMappedCount}/${SOUND_PADS.length} mapped)`}
-                    >
-                      [ml]
-                    </button>
-                    <small>Mouse down · keys 1–9, 0</small>
-                  </div>
-                </div>
-                <div className="sound-pad-grid">
+            {inputMode === "sample" ? (
+              <div className="sample-deck">
+                <div className="pads">
                   {SOUND_PADS.map((pad, index) => (
                     <button
                       key={pad.id}
-                      className={`${selectedPadId === pad.id ? "active" : ""} ${loadingPadId === pad.id ? "loading" : ""}`}
+                      type="button"
+                      className="pad"
+                      aria-pressed={selectedPadId === pad.id}
+                      aria-keyshortcuts={index === 9 ? "0" : String(index + 1)}
+                      title={`Tecla ${index === 9 ? 0 : index + 1}`}
                       onPointerDown={(event) => {
                         if (event.button !== 0) return;
                         event.preventDefault();
                         void selectSoundPad(pad);
                       }}
                       onClick={(event) => {
-                        // Keyboard activation of a focused button has detail 0.
-                        // Pointer clicks already fired on pointer-down.
+                        // Keyboard activation has detail 0; pointer clicks already fired on pointer-down.
                         if (event.detail === 0) void selectSoundPad(pad);
                       }}
-                      aria-pressed={selectedPadId === pad.id}
-                      aria-keyshortcuts={index === 9 ? "0" : String(index + 1)}
                     >
-                      <span>{String(index === 9 ? 0 : index + 1).padStart(2, "0")}</span>
-                      <strong>{loadingPadId === pad.id ? "Loading" : pad.label}</strong>
-                      <i />
+                      <small>{String(index === 9 ? 0 : index + 1).padStart(2, "0")}</small>
+                      <i className="pad-mark" style={{ "--r": `${index * 18}deg` } as CSSProperties} aria-hidden="true" />
+                      <span>{loadingPadId === pad.id ? "…" : pad.label}</span>
                     </button>
                   ))}
                 </div>
-                <p className="sound-pad-credit">
-                  Voice by <a href="https://commons.wikimedia.org/wiki/User:Dvortygirl" target="_blank" rel="noreferrer">Dvortygirl</a>
-                  {" · "}<a href="https://commons.wikimedia.org/" target="_blank" rel="noreferrer">Wikimedia Commons</a>
-                  {" · "}<a href="https://creativecommons.org/licenses/by-sa/3.0/" target="_blank" rel="noreferrer">CC BY-SA 3.0</a>
+                <div className="transport">
+                  <button
+                    type="button"
+                    className="key"
+                    onClick={() => void triggerSample()}
+                    disabled={!sampleName}
+                    aria-label="Disparar una vez"
+                    title="Disparar una vez"
+                  >
+                    <Icon d={ICONS.play} size={28} />
+                  </button>
+                  <button
+                    type="button"
+                    className="key"
+                    aria-pressed={looping}
+                    onClick={toggleLoop}
+                    disabled={!sampleName}
+                    aria-label={looping ? "Detener secuencia" : "Correr secuencia"}
+                    title={looping ? "Detener secuencia" : "Correr secuencia"}
+                  >
+                    <Icon d={ICONS.loop} size={28} />
+                  </button>
+                  <label
+                    className="key"
+                    title={sampleName
+                      ? `${sampleName} · ${sampleDuration.toFixed(2)} s · elegir otro`
+                      : "Cargar sample: WAV, MP3, OGG, FLAC o M4A"}
+                  >
+                    <Icon d={ICONS.upload} size={28} />
+                    <input type="file" accept="audio/*" onChange={loadSample} className="visually-hidden" aria-label="Cargar sample de audio" />
+                  </label>
+                </div>
+              </div>
+            ) : (
+              <div className="capture">
+                <button
+                  type="button"
+                  className="key capture-key"
+                  aria-pressed={sourceActive}
+                  disabled={!secureCapture}
+                  onClick={() => (sourceActive ? stopInput() : startCapture(inputMode))}
+                  title={sourceActive ? "Detener entrada" : inputMode === "microphone" ? "Abrir micrófono" : "Capturar audio del sistema"}
+                >
+                  <Icon d={sourceActive ? ICONS.stop : ICONS.record} size={40} />
+                  <small>{sourceActive ? "STOP" : inputMode === "microphone" ? "MIC" : "SYS"}</small>
+                </button>
+                <p className="capture-note">
+                  {!secureCapture
+                    ? "Requiere HTTPS o localhost."
+                    : inputMode === "microphone"
+                      ? "Micrófono o entrada virtual de loopback."
+                      : "Pestaña del navegador o salida del sistema."}
                 </p>
-              </div>
-              <label className="drop-target">
-                <input type="file" accept="audio/*" onChange={loadSample} />
-                <span className="upload-icon">↥</span>
-                <span className="drop-copy">
-                  <strong>{sampleName || "Load an audio sample"}</strong>
-                  <small>{sampleName ? `${sampleDuration.toFixed(2)} sec · ready to trigger` : "WAV, MP3, OGG, FLAC or M4A"}</small>
-                </span>
-                <span className="browse-label">{sampleName ? "Replace" : "Browse"}</span>
-              </label>
-              <div className="transport-row">
-                <button className="trigger-button" onClick={() => void triggerSample()} disabled={!sampleName}>
-                  <span>▶</span> Trigger once
-                </button>
-                <button className={`loop-button ${looping ? "active" : ""}`} onClick={toggleLoop} disabled={!sampleName}>
-                  <span>↻</span> {looping ? "Stop sequence" : "Run sequence"}
-                </button>
-              </div>
-              <RangeControl label="Trigger rate" value={triggerRate} min={0.1} max={8} step={0.1} unit="Hz" onChange={setTriggerRate} {...midiControlProps("trigger-rate")} />
-              <RangeControl label="Playback rate" value={playbackRate} min={0.25} max={2} step={0.05} unit="×" onChange={setPlaybackRate} {...midiControlProps("playback-rate")} />
-              <p className="param-hint">Frequency and pitch latch on the next loop · sequence phase stays continuous</p>
-            </div>
-          ) : (
-            <div className="capture-controls">
-              <div className="capture-note">
-                <span>{inputMode === "microphone" ? "MIC" : "SYS"}</span>
-                <p>{inputMode === "microphone"
-                  ? "Capture a microphone or a virtual loopback input exposed by your operating system."
-                  : "Share a browser tab or system output. Enable audio in the browser share dialog."}</p>
-              </div>
-              <button
-                className={sourceActive ? "danger-button" : "primary-button"}
-                onClick={() => sourceActive ? stopInput() : startCapture(inputMode)}
-              >
-                {sourceActive ? "Stop input" : `Start ${inputMode === "microphone" ? "microphone" : "system capture"}`}
-              </button>
-              {!secureCapture && <p className="inline-warning">Unavailable on this insecure HTTP address.</p>}
-            </div>
-          )}
-
-          <RangeControl label="Input level" value={inputGain} min={0} max={1.5} step={0.05} unit="" onChange={setInputGain} {...midiControlProps("input-level")} />
-        </article>
-
-        <article className="panel output-panel">
-          <div className="panel-heading">
-            <div>
-              <p className="panel-index">02 / RESPONSE</p>
-              <h2 className="title-with-help">
-                Moshi output
-                <InfoTip text="Moshi plays in the right channel with input monitoring on, or through both speakers with input monitoring muted. The XY scope compares smoothed input and output envelopes." />
-              </h2>
-            </div>
-            <div className={`activity-label ${connection === "live" ? "active green" : ""}`}><i />STREAM {connection.toUpperCase()}</div>
-          </div>
-          <div className="output-visualizers">
-            <div className="scope-wrap output-scope">
-              <AudioScope analyser={outputAnalyser} color="#22d3a6" idleLabel="WAITING FOR MOSHI" />
-              <div className="scope-meta"><span>{monitorMuted ? "MOSHI / L + R" : "MOSHI / RIGHT"}</span><span>BUFFERED LIVE</span></div>
-              <div className="level-meter output"><span style={{ width: `${outputLevel}%` }} /></div>
-            </div>
-            <EnvelopeXYScope inputAnalyser={inputAnalyser} outputAnalyser={outputAnalyser} />
-          </div>
-          <div className="transcript-heading">
-            <div>
-              <span className="live-dot" />
-              LIVE TRANSCRIPT
-              <InfoTip text="Streaming text tokens produced by Moshi. Three repeated normalized sequences arm onset recording." />
-            </div>
-            <button onClick={() => setTranscript("")}>Clear</button>
-          </div>
-          <div className="transcript" ref={transcriptRef}>
-            {transcript ? <p>{transcript}</p> : (
-              <div className="transcript-empty">
-                <span>...</span>
-                <p>Moshi’s inner monologue will appear here as audio is processed.</p>
               </div>
             )}
           </div>
-          <details className="perturbation-panel" open>
-            <summary className="experiment-summary">
-              <span className="title-with-help">
-                Hidden-state trajectories
-                <InfoTip text="Adds a seeded trajectory after one temporal-transformer layer: smooth orbit, cycle-start pulse, or looping random walk. It changes text and audio generation; recurring audio is not guaranteed." />
-              </span>
-              <span>{perturbationStatus ? `${perturbationStatus.dimension}D` : "waiting for engine"}</span>
-            </summary>
-            <div className="perturbation-toolbar">
+        </section>
+
+        <section className="cell monologue-cell" aria-label="Monólogo interior de Moshi">
+          <div className="scopes">
+            <div className="scope" title={`Entrada · nivel ${inputLevel}%`}>
+              <AudioScope analyser={inputAnalyser} variant="input" label="Entrada, canal izquierdo" />
+              <span className="scope-tag">{monitorMuted ? "IN·MUTE" : "IN·L"}</span>
+            </div>
+            <div className="scope" title={`Moshi · nivel ${outputLevel}%`}>
+              <AudioScope analyser={outputAnalyser} variant="output" label="Moshi, canal derecho" />
+              <span className="scope-tag">{monitorMuted ? "OUT·L+R" : "OUT·R"}</span>
+            </div>
+          </div>
+
+          <div className="monologue">
+            <div className="monologue-head">
+              <span>&gt; INNER_MONOLOGUE</span>
               <button
-                className={`orbit-enable ${perturbation.enabled ? "active" : ""}`}
+                type="button"
+                className="key key-small"
+                onClick={() => drainThen(() => setTranscript(""))}
+                disabled={!transcript}
+                aria-label="Borrar monólogo"
+                title="Borrar monólogo"
+              >
+                <Icon d={ICONS.backspace} size={18} />
+              </button>
+            </div>
+            {monologue.current.length ? (
+              <div className={`monologue-body ${draining ? "draining" : ""}`} ref={transcriptRef}>
+                <div className="monologue-history">
+                  {monologue.history.map((line, index) => (
+                    <span key={`${index}-${line}`}>› {line}</span>
+                  ))}
+                </div>
+                <p className="monologue-current" aria-live="polite">
+                  {monologue.current.map((segment, index) => (
+                    <span key={`${index}-${segment.text}`} className={segment.repeated ? "repeated" : undefined}>
+                      {segment.text}
+                    </span>
+                  ))}
+                  <i className="cursor" aria-hidden="true" />
+                </p>
+              </div>
+            ) : (
+              <p className="monologue-current monologue-empty">
+                _<i className="cursor" aria-hidden="true" />
+              </p>
+            )}
+          </div>
+
+          <div
+            className="onset-strip"
+            title={onsetRecording
+              ? `Ataques desde la repetición «${repeatedSequence}». Desfase medio entrada − Moshi: ${raster.meanDelta}`
+              : "Se empieza a registrar cuando Moshi repite tres veces la misma secuencia"}
+          >
+            <div className="onset-rows">
+              <div className="onset-row" aria-label="Ataques de la entrada">
+                {raster.inputs.map((x, index) => (
+                  <i key={`in-${index}`} className="tick tick-in" style={{ left: `${x}%` }} />
+                ))}
+              </div>
+              <div className="onset-rule" />
+              <div className="onset-row" aria-label="Ataques de Moshi">
+                {raster.outputs.map((x, index) => (
+                  <i key={`out-${index}`} className="tick tick-out" style={{ left: `${x}%` }} />
+                ))}
+              </div>
+              {!onsetRecording && <span className="onset-wait">esperando ×3</span>}
+              <div className="onset-scale" aria-hidden="true">
+                <span>{raster.windowStart.toFixed(0)}s</span>
+                <span>{(raster.windowStart + RASTER_WINDOW_SECONDS / 2).toFixed(1)}s</span>
+                <span>{(raster.windowStart + RASTER_WINDOW_SECONDS).toFixed(0)}s</span>
+              </div>
+            </div>
+            <div className="onset-times">
+              <span title="Último ataque de la entrada">{raster.lastIn}</span>
+              <span title="Onset de la última respuesta de Moshi: segundos desde el estímulo">{raster.latency}</span>
+            </div>
+          </div>
+        </section>
+
+        <section className="cell compare" aria-label="Análisis">
+          <div className="caption">
+            <strong>Compará.</strong>
+            <small>IN × OUT</small>
+          </div>
+          <div className="compare-body">
+            <EnvelopeXYScope inputAnalyser={inputAnalyser} outputAnalyser={outputAnalyser} />
+            <dl className="readout">
+              <dt>FRAME</dt><dd>{Math.round(1000 / frameRate)} ms</dd>
+              <dt>PAD</dt><dd>&lt;pad&gt; #{padTokenId}</dd>
+            </dl>
+            <div className="steppers">
+              <Stepper
+                code="RANGE"
+                title="Rango del histograma (solo cambia la vista)"
+                text={`${histogramRange.toFixed(1)}s`}
+                onDecrease={() => setHistogramRange((value) => Math.max(0.5, value - 0.5))}
+                onIncrease={() => setHistogramRange((value) => Math.min(10, value + 0.5))}
+              />
+              <Stepper
+                code="BINS"
+                title="Barras del histograma (solo cambia la vista)"
+                text={String(Math.round(histogramBins))}
+                onDecrease={() => setHistogramBins((value) => Math.max(4, value - 1))}
+                onIncrease={() => setHistogramBins((value) => Math.min(40, value + 1))}
+              />
+            </div>
+            <div className="histogram">
+              <div className="histogram-head">
+                <span>Δt</span>
+                <span className="histogram-tools">
+                  <small title="Ataques registrados: entrada · Moshi">in {histogram.inCount} · out {histogram.outCount}</small>
+                  <button type="button" className="mini-key" onClick={resetOnsetAnalysis} aria-label="Volver a esperar una repetición" title="Volver a esperar una repetición">
+                    <Icon d={ICONS.reset} size={12} />
+                  </button>
+                  <button type="button" className="mini-key" onClick={clearOnsetRecords} aria-label="Borrar registros de ataques" title="Borrar registros de ataques">
+                    <Icon d={ICONS.cross} size={12} />
+                  </button>
+                </span>
+              </div>
+              <div
+                className="histogram-bars"
+                style={{ gridTemplateColumns: `repeat(${histogram.intervals.length}, minmax(0, 1fr))` }}
+                title="Intervalos entre ataques consecutivos: trama = entrada, negro = Moshi"
+              >
+                {histogram.intervals.map((bin, index) => (
+                  <div className="histogram-bin" key={index}>
+                    <i className="bar-in" style={{ height: `${bin.inH}%` }} />
+                    <i className="bar-out" style={{ height: `${bin.outH}%` }} />
+                  </div>
+                ))}
+              </div>
+              <div className="histogram-scale"><span>0</span><span>{histogramRange.toFixed(1)}s</span></div>
+            </div>
+            <div className="histogram">
+              <div className="histogram-head">
+                <span>IN − OUT</span>
+                <small title="Diferencias medidas">n {histogram.deltaCount}</small>
+              </div>
+              <div
+                className="histogram-bars histogram-bars-signed"
+                style={{ gridTemplateColumns: `repeat(${histogram.deltas.length}, minmax(0, 1fr))` }}
+                title="Último ataque de la entrada menos último ataque de Moshi. A la izquierda del cero, la entrada vino primero"
+              >
+                {histogram.deltas.map((height, index) => (
+                  <div className="histogram-bin" key={index}>
+                    <i className="bar-out" style={{ height: `${height}%` }} />
+                  </div>
+                ))}
+                <i className="histogram-zero" aria-hidden="true" />
+              </div>
+              <div className="histogram-scale">
+                <span>−{histogramRange.toFixed(1)}s</span>
+                <span>0</span>
+                <span>+{histogramRange.toFixed(1)}s</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <div className="deck">
+          <Module verb="Repetí." code="SEQ" icon={ICONS.seq}>
+            <Knob code="RATE" title="Disparos por segundo" value={triggerRate} min={0.1} max={8} step={0.1} decimals={2} onChange={setTriggerRate} {...midiControlProps("trigger-rate")} />
+            <Knob code="PITCH" title="Velocidad y altura del sample" value={playbackRate} min={0.25} max={2} step={0.05} decimals={2} unit="×" onChange={setPlaybackRate} {...midiControlProps("playback-rate")} />
+          </Module>
+          <Module verb="Pensá." code="TXT" icon={ICONS.text}>
+            <Knob code="TEMP" title="Temperatura del texto: más alta, más impredecible" value={params.textTemperature} min={0} max={1.2} step={0.01} decimals={2} onChange={(value) => updateParam("textTemperature", value)} {...midiControlProps("text-temperature")} />
+            <Knob code="TOP-K" title="Candidatos de texto por paso" value={params.textTopk} min={1} max={500} step={1} decimals={0} onChange={(value) => updateParam("textTopk", value)} {...midiControlProps("text-top-k")} />
+            <Knob code="PAD" title={`Token ${padTokenId}. Positivo, más silencio. Negativo, Moshi habla sin que le hablen`} value={params.padBias} min={-10} max={10} step={0.05} decimals={1} bipolar onChange={(value) => updateParam("padBias", value)} {...midiControlProps("pad-logit-bias")} />
+          </Module>
+          <Module verb="Soná." code="AUD" icon={ICONS.wave}>
+            <Knob code="TEMP" title="Temperatura del audio" value={params.audioTemperature} min={0} max={1.2} step={0.01} decimals={2} onChange={(value) => updateParam("audioTemperature", value)} {...midiControlProps("audio-temperature")} />
+            <Knob code="TOP-K" title="Candidatos de audio por paso" value={params.audioTopk} min={1} max={500} step={1} decimals={0} onChange={(value) => updateParam("audioTopk", value)} {...midiControlProps("audio-top-k")} />
+          </Module>
+          <Module verb="Mezclá." code="MIX" icon={ICONS.mix}>
+            <Knob code="IN" title="Nivel de entrada" value={inputGain} min={0} max={1.5} step={0.05} decimals={2} onChange={setInputGain} {...midiControlProps("input-level")} />
+            <Knob code="OUT" title="Nivel de salida (solo la reproducción local)" value={outputGain} min={0} max={1.5} step={0.05} decimals={2} onChange={setOutputGain} {...midiControlProps("output-level")} />
+            <div className="knob" title="Ganancia automática: sube la voz baja y limita los picos">
+              <span className="knob-code">AGC</span>
+              <button
+                type="button"
+                className="switch"
+                role="switch"
+                aria-checked={autoGainEnabled}
+                aria-label="Ganancia automática"
+                onClick={() => setAutoGainEnabled((enabled) => !enabled)}
+              >
+                <i />
+              </button>
+              <span className="knob-value">{autoGainEnabled ? `+${autoGainDb.toFixed(1)}dB` : "OFF"}</span>
+              <span className="knob-spacer" />
+            </div>
+          </Module>
+          <Module
+            verb="Desviá."
+            code="TRAJ"
+            icon={ICONS.orbit}
+            title={`Trayectorias en el estado oculto: se suman después de una capa del transformer temporal. ${perturbationStatus ? `${perturbationStatus.dimension}D · ${perturbationStatus.layer_count} capas · seed ${perturbation.seed}` : "esperando al motor"}`}
+            tools={(
+              <>
+                <PhaseIndicator clock={phaseClock} />
+                <button
+                  type="button"
+                  className="mini-key"
+                  onClick={() => updatePerturbation("seed", Math.floor(Math.random() * 2147483647))}
+                  aria-label="Nuevo camino"
+                  title={`Nuevo camino: otra semilla, mismas fase y conversación (seed ${perturbation.seed})`}
+                >
+                  <Icon d={ICONS.dice} size={12} />
+                </button>
+                <button
+                  type="button"
+                  className="mini-key"
+                  disabled={connection !== "live" || !perturbationStatus}
+                  onClick={() => {
+                    phaseResetPendingRef.current = true;
+                    phaseClock.reset(0, performance.now());
+                    send({ type: "metadata", data: { perturbation_reset_phase: true } });
+                  }}
+                  aria-label="Reiniciar la fase"
+                  title="Reiniciar la fase de la trayectoria sin borrar el contexto"
+                >
+                  <Icon d={ICONS.reset} size={12} />
+                </button>
+              </>
+            )}
+          >
+            <div className="knob" title="Activa o apaga la inyección al instante. Al recargar la página arranca apagada">
+              <span className="knob-code">ON</span>
+              <button
+                type="button"
+                className="switch"
                 role="switch"
                 aria-checked={perturbation.enabled}
+                aria-label="Perturbación"
                 disabled={connection !== "live" || !perturbationStatus}
                 onClick={() => updatePerturbation("enabled", !perturbation.enabled)}
               >
-                {perturbation.enabled ? "Perturbation ON" : "Perturbation OFF"}
+                <i />
               </button>
-              <button
-                onClick={() => updatePerturbation("seed", Math.floor(Math.random() * 2147483647))}
-                title="Generate a different seeded trajectory; keep the cycle phase and conversation"
-              >New path</button>
-              <button
-                disabled={connection !== "live" || !perturbationStatus}
-                onClick={() => {
-                  phaseResetPendingRef.current = true;
-                  phaseClock.reset(0, performance.now());
-                  send({ type: "metadata", data: { perturbation_reset_phase: true } });
-                }}
-                title="Restart the trajectory phase without clearing model context"
-              >Phase ↺</button>
-              <span title="Seed fixes the orbit directions">seed {perturbation.seed}</span>
+              <span className="knob-value">{perturbation.enabled ? "ON" : perturbationStatus ? "OFF" : "—"}</span>
+              <span className="knob-spacer" />
             </div>
-            <div className="trajectory-preset-row">
-              <label htmlFor="trajectory-preset">Trajectory</label>
-              <InfoTip text="Presets share the same cycle clock and layer. Switching preserves phase and conversation context. Pulse means zero added vector between kicks, not necessarily silent Moshi output. Walk resets its vector at each cycle boundary." />
+            <div className="knob preset-picker">
+              <span className="knob-code">TRAJ</span>
+              <div className="preset-keys" role="radiogroup" aria-label="Trayectoria">
+                {TRAJECTORY_PRESETS.map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    role="radio"
+                    aria-checked={perturbation.preset === preset}
+                    onClick={() => updatePerturbation("preset", preset)}
+                    title={TRAJECTORY_DESCRIPTIONS[preset]}
+                  >
+                    {PRESET_CODES[preset]}
+                  </button>
+                ))}
+              </div>
+              <span className="knob-value">{PRESET_CODES[perturbation.preset]}</span>
               <button
                 type="button"
-                className={`midi-learn-button ${midiLearning === "orbit-preset" ? "learning" : ""} ${midiMappings["orbit-preset"] ? "mapped" : ""}`}
-                title="MIDI learn trajectory: CC 0–42 selects orbit, 43–84 pulse, 85–127 walk"
-                aria-label="MIDI learn trajectory preset"
+                className={`midi-dot ${midiLearning === "orbit-preset" ? "learning" : ""} ${midiMappings["orbit-preset"] ? "mapped" : ""}`}
+                aria-pressed={midiLearning === "orbit-preset"}
+                aria-label="MIDI learn de la trayectoria"
+                title="MIDI learn: CC 0–42 órbita, 43–84 pulso, 85–127 caminata"
                 onClick={() => void beginMidiLearn("orbit-preset")}
-              >[ml]</button>
-              <select
-                id="trajectory-preset"
-                aria-label="Trajectory preset"
-                value={perturbation.preset}
-                onChange={(event) => updatePerturbation("preset", event.target.value as TrajectoryPreset)}
               >
-                <option value="orbit">Smooth orbit</option>
-                <option value="pulse">Cycle-start pulse</option>
-                <option value="walk">Looping random walk</option>
-              </select>
+                <MidiGlyph />
+              </button>
             </div>
-            <p className="trajectory-description">{TRAJECTORY_DESCRIPTIONS[perturbation.preset]}</p>
-            <div className="perturbation-controls">
-              <RangeControl label="Strength" help="Overall trajectory gain relative to hidden-state RMS, from 0 to 10. Smooth orbit and pulse vectors have unit RMS before gain; walk magnitude grows as steps accumulate. Start at 0.05–0.2; high values can destabilize generation. Zero bypasses immediately; conversation effects remain until context is cleared." value={perturbation.strength} min={0} max={10} step={0.01} unit="× RMS" onChange={(value) => updatePerturbation("strength", value)} {...midiControlProps("orbit-strength")} />
-              <RangeControl label="Cycle rate" help="Orbits per second of model audio time, up to 6 Hz. Changing rate preserves phase. Silent input advances the orbit; stopped inference pauses it. Higher harmonics may alias at the model frame rate." value={perturbation.frequency} min={0.01} max={perturbationStatus?.max_frequency ?? 6} step={0.01} unit="Hz" onChange={(value) => updatePerturbation("frequency", value)} {...midiControlProps("orbit-frequency")} />
-              <RangeControl label="Layer" help="One-based temporal transformer block. The orbit is added after this block; changing layers keeps model context but may abruptly change behavior." value={perturbation.layer} min={1} max={perturbationStatus?.layer_count ?? 32} step={1} unit="" onChange={(value) => updatePerturbation("layer", value)} {...midiControlProps("orbit-layer")} />
-              {perturbation.preset === "orbit" && (
-                <RangeControl label="Harmonics" help="Fourier harmonics in random orthonormal directions. One makes a circle; more add complex closed motion. Changing this regenerates directions using the same seed." value={perturbation.harmonics} min={1} max={perturbationStatus?.max_harmonics ?? 6} step={1} unit="" onChange={(value) => updatePerturbation("harmonics", value)} {...midiControlProps("orbit-harmonics")} />
-              )}
-              {perturbation.preset === "walk" && (
-                <RangeControl label="Walk step" help="RMS of each random-direction increment before overall strength. Zero holds the first vector. Larger steps and longer cycles produce more accumulated drift; the vector jumps back at each cycle boundary." value={perturbation.walk_step} min={0} max={1} step={0.01} unit="× RMS" onChange={(value) => updatePerturbation("walk_step", value)} {...midiControlProps("orbit-walk-step")} />
-              )}
-            </div>
-            <div className="orbit-telemetry">
-              <span>{(1 / perturbation.frequency).toFixed(2)} s/cycle</span>
-              <span>{perturbationStatus?.frame_rate ?? 12.5} steps/s</span>
-              <PhaseIndicator clock={phaseClock} />
-            </div>
-          </details>
-          <OnsetAnalysis
-            armed={onsetRecording}
-            repetition={repeatedSequence}
-            inputOnsets={inputOnsets}
-            outputOnsets={outputOnsets}
-            crossDeltas={crossOnsetDeltas}
-            elapsed={onsetElapsed}
-            onReset={resetOnsetAnalysis}
-            histogramRange={histogramRange}
-            histogramBins={histogramBins}
-          />
-        </article>
+            <Knob code="STR" title="Fuerza relativa al RMS del estado oculto, de 0 a 10. Empezá entre 0.05 y 0.2; valores altos pueden desestabilizar. Shift + arrastre para ajuste fino" value={perturbation.strength} min={0} max={10} step={0.01} decimals={2} unit="×" onChange={(value) => updatePerturbation("strength", value)} {...midiControlProps("orbit-strength")} />
+            <Knob code="RATE" title={`Ciclos por segundo de audio del modelo (${(1 / perturbation.frequency).toFixed(2)} s por ciclo). Cambiarlo conserva la fase`} value={perturbation.frequency} min={0.01} max={perturbationStatus?.max_frequency ?? 6} step={0.01} decimals={2} unit="Hz" onChange={(value) => updatePerturbation("frequency", value)} {...midiControlProps("orbit-frequency")} />
+            <Knob code="LAYER" title="Bloque del transformer temporal (desde 1) después del cual se suma la trayectoria" value={perturbation.layer} min={1} max={perturbationStatus?.layer_count ?? 32} step={1} decimals={0} onChange={(value) => updatePerturbation("layer", value)} {...midiControlProps("orbit-layer")} />
+            {perturbation.preset === "orbit" && (
+              <Knob code="HARM" title="Armónicos de Fourier en direcciones ortonormales al azar. Uno es un círculo; más, movimiento cerrado más complejo" value={perturbation.harmonics} min={1} max={perturbationStatus?.max_harmonics ?? 6} step={1} decimals={0} onChange={(value) => updatePerturbation("harmonics", value)} {...midiControlProps("orbit-harmonics")} />
+            )}
+            {perturbation.preset === "walk" && (
+              <Knob code="STEP" title="RMS de cada paso de la caminata antes de la fuerza. Cero mantiene el primer vector" value={perturbation.walk_step} min={0} max={1} step={0.01} decimals={2} onChange={(value) => updatePerturbation("walk_step", value)} {...midiControlProps("orbit-walk-step")} />
+            )}
+          </Module>
+        </div>
 
-        <aside className="panel params-panel">
-          <div className="panel-heading">
-            <div>
-              <p className="panel-index">03 / CONTROLS</p>
-              <h2 className="title-with-help">
-                More controls
-                <InfoTip text="Audio playback, onset visualization, and live model sampling controls." />
-              </h2>
-            </div>
+        <section className="cell forget" aria-label="Contexto del modelo">
+          <div className="caption">
+            <strong>Olvidá.</strong>
+            <small>CTX</small>
           </div>
-
-          <section className="controls-section audio-output-controls">
-            <div className="controls-section-heading">
-              <span className="title-with-help">
-                Audio output
-                <InfoTip text="Controls local Moshi playback only; these settings do not alter model generation." />
-              </span>
-            </div>
+          <div className="forget-body">
             <button
-              className={`agc-control ${autoGainEnabled ? "active" : ""}`}
-              role="switch"
-              aria-checked={autoGainEnabled}
-              onClick={() => setAutoGainEnabled((enabled) => !enabled)}
-            >
-              <span className="agc-switch"><i /></span>
-              <span><strong>Automatic gain</strong><small>Quiet-speech lift with peak limiting</small></span>
-              <em>{autoGainEnabled ? `+${autoGainDb.toFixed(1)} dB` : "OFF"}</em>
-            </button>
-            <RangeControl label="Output level" value={outputGain} min={0} max={1.5} step={0.05} unit="" onChange={setOutputGain} {...midiControlProps("output-level")} />
-          </section>
-
-          <section className="controls-section sampling-controls">
-            <div className="controls-section-heading">
-              <span className="title-with-help">
-                Sampling control
-                <InfoTip text="Sampling values are sent live and affect upcoming tokens without clearing model context." />
-              </span>
-              <button className="reset-button" onClick={() => {
-                setParams(DEFAULT_PARAMS);
-                paramsRef.current = DEFAULT_PARAMS;
-                sendSamplingParams(DEFAULT_PARAMS);
-                localStorage.setItem("moshi-studio-params", JSON.stringify(DEFAULT_PARAMS));
-              }}>Defaults</button>
-            </div>
-            <RangeControl label="Text temperature" value={params.textTemperature} min={0} max={1.2} step={0.01} unit="" onChange={(value) => updateParam("textTemperature", value)} accent="green" {...midiControlProps("text-temperature")} />
-            <RangeControl label="Text top-k" value={params.textTopk} min={1} max={500} step={1} unit="" onChange={(value) => updateParam("textTopk", value)} accent="green" {...midiControlProps("text-top-k")} />
-            <RangeControl label="PAD logit bias" value={params.padBias} min={-10} max={10} step={0.05} unit="" onChange={(value) => updateParam("padBias", value)} accent="green" {...midiControlProps("pad-logit-bias")} />
-            <p className="param-hint">Token {padTokenId} · positive is quieter · negative is more willing to speak</p>
-            <div className="param-divider" />
-            <RangeControl label="Audio temperature" value={params.audioTemperature} min={0} max={1.2} step={0.01} unit="" onChange={(value) => updateParam("audioTemperature", value)} accent="orange" {...midiControlProps("audio-temperature")} />
-            <RangeControl label="Audio top-k" value={params.audioTopk} min={1} max={500} step={1} unit="" onChange={(value) => updateParam("audioTopk", value)} accent="orange" {...midiControlProps("audio-top-k")} />
-            <button
-              className="context-reset-button"
+              type="button"
+              className="key flush"
               disabled={connection !== "live"}
-              onClick={resetContext}
+              onClick={() => drainThen(resetContext)}
+              aria-label="Borrar el contexto del modelo; la conexión sigue"
+              title="Borrar el contexto del modelo: Moshi olvida, la conexión y el sampler siguen"
             >
-              <span>↺</span>
-              <span><strong>Clear model context</strong><small>Keep connection and sampler running</small></span>
+              <Icon d={ICONS.reset} size={30} />
+              <small>FLUSH</small>
             </button>
-          </section>
-
-          <section className="controls-section onset-plot-controls">
-            <div className="controls-section-heading">
-              <span className="title-with-help">
-                Onsets
-                <InfoTip text="View settings change histogram rendering only. Existing onset measurements remain intact." />
-              </span>
-            </div>
-            <RangeControl label="Range" value={histogramRange} min={0.5} max={10} step={0.5} unit="s" onChange={setHistogramRange} {...midiControlProps("histogram-range")} />
-            <RangeControl label="Bins" value={histogramBins} min={4} max={40} step={1} unit="" onChange={setHistogramBins} {...midiControlProps("histogram-bins")} />
-            <button
-              className="clear-onsets-button"
-              onClick={clearOnsetRecords}
-              aria-label="Clear onset records"
-              title="Clear onset records; keep detector state and plot settings"
-            >
-              ×
+            <button type="button" className="key defaults" onClick={resetDefaults} title="Valores por defecto del muestreo">
+              <small>DEFAULTS</small>
             </button>
-          </section>
-
-          <div className="signal-readout">
-            <div><span>MODEL</span><strong>MOSHIKO 7B</strong></div>
-            <div><span>PAD TOKEN</span><strong>{padTokenId} · &lt;pad&gt;</strong></div>
-            <div><span>CODEC</span><strong>MIMI 24K</strong></div>
-            <div><span>LATENCY</span><strong>STREAMING</strong></div>
           </div>
-        </aside>
-      </section>
+        </section>
+      </div>
     </main>
   );
 };
 
-type RangeControlProps = {
-  label: string;
-  help?: string;
+const MODEL_NAME = "moshiko-7b";
+const CURRENT_LINE_BUDGET = 72;
+const HISTORY_LINES = 4;
+const RASTER_WINDOW_SECONDS = 15;
+
+const ICONS = {
+  play: "M7 4 L19 12 L7 20 Z",
+  loop: "M20 12 A8 8 0 1 1 17.7 6.3 M20 3 V8 H15",
+  upload: "M12 16 V4 M6 10 L12 4 L18 10 M4 20 H20",
+  reset: "M4 12 A8 8 0 1 0 6.3 6.3 M4 3 V8 H9",
+  cross: "M6 6 L18 18 M18 6 L6 18",
+  backspace: "M8 5 H21 V19 H8 L2 12 Z M11 9 L17 15 M17 9 L11 15",
+  lock: "M5 11 H19 V21 H5 Z M8 11 V7 A4 4 0 0 1 16 7",
+  speakerOn: "M3 9 H7 L12 5 V19 L7 15 H3 Z M16 9 A4 4 0 0 1 16 15 M18.5 6.5 A8 8 0 0 1 18.5 17.5",
+  speakerOff: "M3 9 H7 L12 5 V19 L7 15 H3 Z M16 9 L22 15 M22 9 L16 15",
+  record: "M12 4 A8 8 0 1 1 11.99 4 Z",
+  stop: "M6 6 H18 V18 H6 Z",
+  seq: "M3 12 H6 M10 12 H13 M17 12 H20 M3 6 V18",
+  text: "M4 5 H20 M12 5 V20 M8 20 H16",
+  wave: "M2 12 H5 L7 7 L10 17 L13 4 L16 20 L18 12 H22",
+  mix: "M6 3 V21 M12 3 V21 M18 3 V21 M3 8 H9 M9 15 H15 M15 10 H21",
+  sample: "M2 12 H5 L8 5 L12 19 L15 8 L17 12 H22",
+  mic: "M9 3 H15 V13 H9 Z M5 11 A7 7 0 0 0 19 11 M12 18 V22 M8 22 H16",
+  system: "M3 4 H21 V16 H3 Z M8 20 H16 M12 16 V20",
+  orbit: "M12 3 A9 4 0 1 1 11.99 3 Z M12 8 A3 3 0 1 1 11.99 8 Z",
+  dice: "M4 4 H20 V20 H4 Z M8.5 8.5 H8.6 M15.5 15.5 H15.6 M15.5 8.5 H15.6 M8.5 15.5 H8.6",
+};
+
+const PRESET_CODES: Record<TrajectoryPreset, string> = { orbit: "ORB", pulse: "PUL", walk: "WLK" };
+
+const SOURCES: { mode: InputMode; code: string; title: string; icon: string }[] = [
+  { mode: "sample", code: "LOOP", title: "Sample en loop", icon: ICONS.sample },
+  { mode: "microphone", code: "MIC", title: "Micrófono", icon: ICONS.mic },
+  { mode: "system", code: "SYS", title: "Audio del sistema o de una pestaña", icon: ICONS.system },
+];
+
+const Icon: FC<{ d: string; size: number }> = ({ d, size }) => (
+  <svg className="icon" viewBox="0 0 24 24" width={size} height={size} aria-hidden="true">
+    <path d={d} />
+  </svg>
+);
+
+const MidiGlyph: FC = () => (
+  <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">
+    <circle cx="2.5" cy="6" r="1.2" />
+    <circle cx="9.5" cy="6" r="1.2" />
+    <circle cx="3.6" cy="3" r="1.2" />
+    <circle cx="8.4" cy="3" r="1.2" />
+    <circle cx="6" cy="2" r="1.2" />
+  </svg>
+);
+
+const Module: FC<{
+  verb: string;
+  code: string;
+  icon: string;
+  title?: string;
+  tools?: ReactNode;
+  children: ReactNode;
+}> = ({ verb, code, icon, title, tools, children }) => (
+  <section className="cell module" aria-label={verb}>
+    <div className="caption">
+      <strong title={title}>{verb}</strong>
+      <span className="caption-tools">
+        {tools}
+        <span className="module-code" title={title ?? code}>
+          <Icon d={icon} size={14} />
+          <small>{code}</small>
+        </span>
+      </span>
+    </div>
+    <div className="module-body">{children}</div>
+  </section>
+);
+
+const Stepper: FC<{
+  code: string;
+  title: string;
+  text: string;
+  onDecrease: () => void;
+  onIncrease: () => void;
+}> = ({ code, title, text, onDecrease, onIncrease }) => (
+  <div className="stepper" title={title}>
+    <span>{code}</span>
+    <div className="stepper-box">
+      <button type="button" onClick={onDecrease} aria-label={`Bajar ${code}`}>−</button>
+      <output>{text}</output>
+      <button type="button" onClick={onIncrease} aria-label={`Subir ${code}`}>+</button>
+    </div>
+  </div>
+);
+
+function polar(angle: number, radius: number) {
+  const radians = (angle * Math.PI) / 180;
+  return { x: 32 + radius * Math.sin(radians), y: 32 - radius * Math.cos(radians) };
+}
+
+function arcPath(from: number, to: number, radius = 26) {
+  if (Math.abs(to - from) < 0.5) return "M0 0";
+  const start = polar(from, radius);
+  const end = polar(to, radius);
+  return `M${start.x.toFixed(2)} ${start.y.toFixed(2)} A${radius} ${radius} 0 ${to - from > 180 ? 1 : 0} 1 ${end.x.toFixed(2)} ${end.y.toFixed(2)}`;
+}
+
+type KnobProps = {
+  code: string;
+  title: string;
   value: number;
   min: number;
   max: number;
   step: number;
-  unit: string;
+  decimals: number;
+  unit?: string;
+  bipolar?: boolean;
   onChange: (value: number) => void;
-  accent?: "green" | "orange";
   midiKey?: string;
   midiLearning?: boolean;
   midiMapping?: MidiMapping;
@@ -1595,68 +1925,110 @@ type RangeControlProps = {
   ) => () => void;
 };
 
-const RangeControl: FC<RangeControlProps> = ({
-  label,
-  help,
+/** A drawn dial: drag up or right to raise, down or left to lower; arrow keys work too. */
+const Knob: FC<KnobProps> = ({
+  code,
+  title,
   value,
   min,
   max,
   step,
-  unit,
+  decimals,
+  unit = "",
+  bipolar = false,
   onChange,
-  accent = "orange",
   midiKey,
   midiLearning = false,
   midiMapping,
   onMidiLearn,
   registerMidiTarget,
 }) => {
-  const percentage = ((value - min) / (max - min)) * 100;
+  const dragRef = useRef<{ x: number; y: number; value: number } | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const quantize = useCallback((raw: number) => {
+    const snapped = min + Math.round((raw - min) / step) * step;
+    return Number(Math.min(max, Math.max(min, snapped)).toFixed(6));
+  }, [max, min, step]);
+
   useEffect(() => {
     if (!midiKey || !registerMidiTarget) return;
     return registerMidiTarget(midiKey, (normalizedValue) => {
-      const rawValue = min + normalizedValue * (max - min);
-      const quantized = min + Math.round((rawValue - min) / step) * step;
-      onChange(Number(Math.min(max, Math.max(min, quantized)).toFixed(6)));
+      onChange(quantize(min + normalizedValue * (max - min)));
     });
-  }, [max, midiKey, min, onChange, registerMidiTarget, step]);
+  }, [max, midiKey, min, onChange, quantize, registerMidiTarget]);
 
+  const ratio = (value - min) / (max - min);
+  const angle = -135 + ratio * 270;
+  const origin = bipolar ? 0 : -135;
+  const tip = polar(angle, 14);
+  const base = polar(angle, 5);
+  const text = `${bipolar && value > 0 ? "+" : ""}${value.toFixed(decimals)}${unit}`;
   const midiTitle = midiLearning
-    ? "Learning: move a MIDI CC control; click again to cancel"
+    ? "Aprendiendo: mové un control MIDI; clic para cancelar"
     : midiMapping
-      ? `${midiMapping.inputName} · CH ${midiMapping.channel + 1} CC ${midiMapping.controller}; click to relearn`
-      : "MIDI learn: click, then move a MIDI CC control";
+      ? `${midiMapping.inputName} · CH ${midiMapping.channel + 1} CC ${midiMapping.controller}; clic para reasignar`
+      : "MIDI learn: clic y mové un control";
 
   return (
-    <div className={`range-control ${accent}`}>
-      <span className="range-label-row">
-        <span className="range-label">{label}</span>
-        {help && <InfoTip text={help} />}
-        {midiKey && onMidiLearn && (
-          <button
-            type="button"
-            className={`midi-learn-button ${midiLearning ? "learning" : ""} ${midiMapping ? "mapped" : ""}`}
-            title={midiTitle}
-            aria-label={`${label}: ${midiTitle}`}
-            onClick={() => onMidiLearn(midiKey)}
-          >
-            [ml]
-          </button>
-        )}
-      </span>
-      <span className="range-value">{step < 1 ? value.toFixed(2) : value}{unit && <em>{unit}</em>}</span>
-      <input
-        aria-label={label}
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        style={{ "--range-progress": `${percentage}%` } as React.CSSProperties}
-        onChange={(event) => onChange(Number(event.target.value))}
-      />
-      <span className="range-min">{min}</span>
-      <span className="range-max">{max}</span>
+    <div className="knob" title={title}>
+      <span className="knob-code">{code}</span>
+      <div
+        className="knob-dial"
+        onPointerDown={(event) => {
+          if (event.button !== 0) return;
+          event.preventDefault();
+          event.currentTarget.setPointerCapture(event.pointerId);
+          dragRef.current = { x: event.clientX, y: event.clientY, value };
+          inputRef.current?.focus();
+        }}
+        onPointerMove={(event) => {
+          const drag = dragRef.current;
+          if (!drag) return;
+          const delta = (event.clientX - drag.x) - (event.clientY - drag.y);
+          const travel = event.shiftKey ? 1280 : 160;
+          onChange(quantize(drag.value + (delta * (max - min)) / travel));
+        }}
+        onPointerUp={() => {
+          dragRef.current = null;
+        }}
+        onPointerCancel={() => {
+          dragRef.current = null;
+        }}
+      >
+        <svg viewBox="0 0 64 64" width="64" height="64" aria-hidden="true">
+          <path className="knob-track" d={arcPath(-135, 135)} />
+          <path className="knob-arc" d={arcPath(Math.min(origin, angle), Math.max(origin, angle))} />
+          <circle className="knob-cap" cx="32" cy="32" r="17" />
+          <line className="knob-needle" x1={base.x} y1={base.y} x2={tip.x} y2={tip.y} />
+        </svg>
+        <input
+          ref={inputRef}
+          type="range"
+          min={min}
+          max={max}
+          step={step}
+          value={value}
+          aria-label={title}
+          aria-valuetext={text}
+          onChange={(event) => onChange(Number(event.target.value))}
+        />
+      </div>
+      <span className="knob-value">{text}</span>
+      {midiKey && onMidiLearn ? (
+        <button
+          type="button"
+          className={`midi-dot ${midiLearning ? "learning" : ""} ${midiMapping ? "mapped" : ""}`}
+          aria-pressed={midiLearning}
+          aria-label={`${code}: ${midiTitle}`}
+          title={midiTitle}
+          onClick={() => onMidiLearn(midiKey)}
+        >
+          <MidiGlyph />
+        </button>
+      ) : (
+        <span className="knob-spacer" />
+      )}
     </div>
   );
 };
