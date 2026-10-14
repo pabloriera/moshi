@@ -185,3 +185,6 @@ mlx-trace.json
 /scripts/token.txt
 uv.lock
 tts-outputs
+
+# Independent nested fine-tuning repository
+/moshi-finetune/
