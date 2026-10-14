@@ -4,6 +4,7 @@
 
 import argparse
 import asyncio
+from contextlib import suppress
 from dataclasses import dataclass
 import inspect
 import json
@@ -25,6 +26,7 @@ from .client_utils import log
 from .models import loaders, MimiModel, LMModel, LMGen
 from .run_inference import get_condition_tensors
 from .perturbation import CyclicPerturbation
+from .telemetry import RuntimeTelemetry
 
 
 def seed_all(seed):
@@ -55,7 +57,11 @@ class ServerState:
             lm.transformer, lm.text_linear.in_features, mimi.frame_rate,
         )
         condition_tensors = get_condition_tensors(model_type, lm, batch_size=1, cfg_coef=cfg_coef)
+        kwargs["measure_entropy"] = True
         self.lm_gen = LMGen(lm, cfg_coef=cfg_coef, condition_tensors=condition_tensors, **kwargs)
+        # Register after perturbation hooks, so the displayed state includes
+        # any live injection at the selected block.
+        self.telemetry = RuntimeTelemetry(lm.transformer, lm.text_linear.in_features, mimi.frame_rate)
 
         self.device = device
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
@@ -77,6 +83,13 @@ class ServerState:
                 _ = self.mimi.decode(tokens[:, 1:])
 
         torch.cuda.synchronize()
+        self.telemetry.start()
+
+    async def publish_telemetry(self, ws):
+        while not ws.closed:
+            for report in self.telemetry.poll():
+                await ws.send_bytes(b"\x04" + json.dumps(report).encode("utf8"))
+            await asyncio.sleep(0.04)
 
     def update_sampling_params(self, data: dict) -> dict:
         """Update generation sampling without resetting the active stream."""
@@ -88,6 +101,7 @@ class ServerState:
             "pad_mult": ("pad_mult", float, -10.0, 10.0),
         }
         applied = {}
+        audio_changed = False
         for key, (attribute, cast, minimum, maximum) in params.items():
             if key not in data:
                 continue
@@ -96,8 +110,16 @@ class ServerState:
             except (TypeError, ValueError):
                 continue
             value = max(minimum, min(maximum, value))
+            if attribute in ("temp", "top_k") and value != getattr(self.lm_gen, attribute, None):
+                audio_changed = True
             setattr(self.lm_gen, attribute, value)
             applied[key] = value
+        # Python sampling parameters are constants in the captured depth graph.
+        # Recapture only that graph after an audio control change; keep temporal
+        # KV caches and the observed trajectory intact. Text samples outside it.
+        state = self.lm_gen._streaming_state
+        if audio_changed and state is not None and state.graphed_depth is not None:
+            state.graphed_depth.reset()
         return applied
 
     async def decode_and_send(
@@ -175,8 +197,14 @@ class ServerState:
                             # Report every inference step, including startup
                             # steps with no output tokens yet. Keep this small:
                             # full configuration is sent only on control changes.
-                            report = json.dumps({"perturbation_phase": self.perturbation.phase})
+                            report = json.dumps({
+                                "perturbation_phase": self.perturbation.phase,
+                                "runtime_measurements": self.telemetry.measure(self.lm_gen.sampling_entropy),
+                            })
                             await ws.send_bytes(b"\x04" + report.encode("utf8"))
+                            # Yield even for a large incoming audio packet so
+                            # completed projections can be published promptly.
+                            await asyncio.sleep(0)
                             if tokens is None:
                                 continue
                             await self.decode_and_send(tokens, ws, opus_writer)
@@ -190,6 +218,10 @@ class ServerState:
                     if not isinstance(metadata, dict):
                         log("warning", "metadata message must be an object")
                         continue
+                    telemetry = metadata.get("telemetry")
+                    if isinstance(telemetry, dict):
+                        report = {"telemetry_status": self.telemetry.update(telemetry), "trajectory_reset": True}
+                        await ws.send_bytes(b"\x04" + json.dumps(report).encode("utf8"))
                     sampling = metadata.get("sampling")
                     if isinstance(sampling, dict):
                         applied = self.update_sampling_params(sampling)
@@ -228,11 +260,13 @@ class ServerState:
                     self.mimi.reset_streaming()
                     self.lm_gen.reset_streaming()
                     self.perturbation.reset_phase()
+                    self.telemetry.reset()
                     log("info", "streaming context reset")
                     acknowledgement = json.dumps({
                         "stream_reset": True,
                         "reason": "user",
                         "perturbation_phase": self.perturbation.phase,
+                        "trajectory_reset": True,
                     }).encode("utf8")
                     await ws.send_bytes(b"\x04" + acknowledgement)
                 else:
@@ -278,13 +312,22 @@ class ServerState:
             self.lm_gen.reset_streaming()
             self.perturbation.update({"enabled": False})
             self.perturbation.reset_phase()
+            self.telemetry.reset()
+            publisher = None
             try:
                 # Send the handshake only after this socket owns the model.
                 await ws.send_bytes(b"\x00")
                 report = json.dumps({"perturbation_status": self.perturbation.status()})
                 await ws.send_bytes(b"\x04" + report.encode("utf8"))
+                report = json.dumps({"telemetry_status": self.telemetry.status()})
+                await ws.send_bytes(b"\x04" + report.encode("utf8"))
+                publisher = asyncio.create_task(self.publish_telemetry(ws))
                 await self.recv_loop(ws, opus_reader, opus_writer)
             finally:
+                if publisher is not None:
+                    publisher.cancel()
+                    with suppress(asyncio.CancelledError, ConnectionResetError):
+                        await publisher
                 if self.active_ws is ws:
                     self.active_ws = None
         log("info", "done with connection")
@@ -366,6 +409,16 @@ def main():
     log("info", "warming up the model")
     state.warmup()
     app = web.Application()
+
+    async def shutdown_stream(_app):
+        if state.active_ws is not None and not state.active_ws.closed:
+            await state.active_ws.close(code=1001, message=b"server restarting")
+
+    async def cleanup_telemetry(_app):
+        state.telemetry.close()
+
+    app.on_cleanup.append(cleanup_telemetry)
+    app.on_shutdown.append(shutdown_stream)
     app.router.add_get("/api/chat", state.handle_chat)
     static_path: None | str = None
     if args.static is None:

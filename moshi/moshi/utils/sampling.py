@@ -48,7 +48,19 @@ def multinomial(
     return output
 
 
-def sample_top_k(probs: torch.Tensor, k: int) -> torch.Tensor:
+def _record_entropy(probs: torch.Tensor, entropy_out: torch.Tensor | None):
+    """Shannon entropy in bits of the actual (possibly unnormalised) support.
+
+    Writes a fixed-address tensor so measurements also run during CUDA replay.
+    This does not draw random numbers or change the sampling distribution.
+    """
+    if entropy_out is not None:
+        normalized = probs / probs.sum(dim=-1, keepdim=True)
+        entropy = -(normalized * normalized.clamp_min(torch.finfo(probs.dtype).tiny).log2()).sum(dim=-1)
+        entropy_out.copy_(entropy.mean().expand_as(entropy_out))
+
+
+def sample_top_k(probs: torch.Tensor, k: int, entropy_out: torch.Tensor | None = None) -> torch.Tensor:
     """Sample next token from top K values along the last dimension of the input probs tensor.
 
     Args:
@@ -59,12 +71,13 @@ def sample_top_k(probs: torch.Tensor, k: int) -> torch.Tensor:
     """
     k = min(k, probs.shape[-1])
     probs, indices = torch.topk(probs, k, dim=-1)
+    _record_entropy(probs, entropy_out)
     next_token = multinomial(probs, num_samples=1)
     next_token = indices.gather(-1, next_token)
     return next_token
 
 
-def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
+def sample_top_p(probs: torch.Tensor, p: float, entropy_out: torch.Tensor | None = None) -> torch.Tensor:
     """Sample next token from top P probabilities along the last dimension of the input probs tensor.
 
     Args:
@@ -78,6 +91,7 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     mask = probs_sum - probs_sort > p
     probs_sort *= (~mask).float()
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    _record_entropy(probs_sort, entropy_out)
     next_token = multinomial(probs_sort, num_samples=1)
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
@@ -91,6 +105,7 @@ def sample_token(
     top_p: float = 0.0,
     bias_token_id: int | None = None,
     bias: float = 0.0,
+    entropy_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Given logits of shape [*, Card], returns a LongTensor of shape [*].
 
@@ -110,12 +125,15 @@ def sample_token(
             sampling_logits[..., bias_token_id] += bias
         probs = torch.softmax(sampling_logits, dim=-1)
         if top_p > 0.0:
-            next_token = sample_top_p(probs, p=top_p)
+            next_token = sample_top_p(probs, p=top_p, entropy_out=entropy_out)
         elif top_k > 0:
-            next_token = sample_top_k(probs, k=top_k)
+            next_token = sample_top_k(probs, k=top_k, entropy_out=entropy_out)
         else:
+            _record_entropy(probs, entropy_out)
             next_token = multinomial(probs, num_samples=1)
     else:
+        if entropy_out is not None:
+            entropy_out.zero_()
         next_token = torch.argmax(logits, dim=-1, keepdim=True)
     assert next_token.shape[-1] == 1
     return next_token[..., 0]

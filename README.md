@@ -157,6 +157,105 @@ context and sampling can respond non-periodically. Implementation:
 [`moshi/moshi/server.py`](moshi/moshi/server.py) before CUDA graph warmup and
 updated before each generation step.
 
+### Runtime entropy and the 2D/3D state view
+
+The central **ESTADO** panel shows time-series oscilloscopes alongside the
+diffusion map: three compact signal columns and a fourth column for the map.
+Each **L01…L32** channel reports the L2 norm of the full residual vector after
+that temporal-transformer block, including any injected perturbation. **TXT**
+and **A1…A8** report sampling entropy for text and each generated audio codebook.
+Entropy applies to these probability distributions; residual states are not
+treated as probabilities. These are token-distribution entropies, not waveform
+entropy or the surprise of the chosen token. **Compará.** shows only the
+input/output envelope Lissajous.
+
+Choose **‖h‖**, **H · bits**, or **‖h‖ + H** to display norms, entropies, or both.
+Each signal occupies a compact 16–18 px row within its column, with time
+increasing left to right and the latest frame at the right edge. On desktop,
+the 41 channels occupy 14 rows; narrower screens use fewer signal columns and
+stack the map below. The layout reserves enough height for every signal, so the
+scopes need no internal scrolling. All channels share the selected
+20/50-frame time window; hover a trace for its exact value and observed range.
+Numbers retain their original values, while each curve is centered and scaled
+independently to show variations. The display range follows the median and
+10th/90th percentiles of the latest 20 samples, adapting gradually on each
+received model frame. Tiny entropy changes remain visible; older outliers
+are compressed at the edges with a smooth bounded transform. Constant values
+remain flat, and the range stops moving when inference stops. Very small values
+use scientific notation in the readout. Projection pause stops trajectory
+collection but norms and entropy continue to update. Changing the observed layer
+highlights its norm channel without discarding measurement history.
+
+The monologue starts in a compact view with only the latest two lines of large
+text; the small history lines are removed. Its **+ / −** button expands or shrinks
+the text area. Compact mode gives the freed height to the state/oscilloscope view.
+
+Press **Space** (or the square stop key in the header) to stop the engine:
+sample sequencing, microphone/system capture, model input streaming, and queued
+input/output playback stop together. Scope and trajectory updates stop as well.
+The model connection and conversation are retained. Trigger a pad, start the
+sequence, or activate capture to resume. Space is ignored while typing or using
+a select/input field, and holding it does not retrigger the engine.
+
+Moshi measures Shannon entropy, `−Σ p log₂(p)`, at every sampling procedure,
+after temperature, text PAD bias, and top-k/top-p filtering and renormalisation.
+Greedy sampling has zero entropy. Each inference frame reports text plus all
+eight generated audio codebooks, including startup frames. Measurement does
+not consume sampling RNG. Tensor buffers update during CUDA graph replay;
+audio sampling control changes refresh only the depth graph, preserving
+conversation context.
+
+The map's **2D/3D** views project the last **20 or 50 frames** of a
+selected temporal-transformer layer, after any perturbation at that block.
+Select **2D** or **3D**, the layer with **L**, and the window. Switching dimensions
+reprojects the collected frames into two or three diffusion coordinates without
+resetting model context. Drag the 3D drawing to rotate the camera; 2D uses a
+flat view. The pause key suspends collection/projection while inference and
+entropy measurement continue. Layer/window changes begin a fresh window;
+**FLUSH** and a new connection also clear the trajectory. At 12.5 model frames
+per second, the buffers cover approximately 1.6 and 4 seconds. No new frames
+means no new motion in the plot.
+
+The worker uses [diffusion maps](https://doi.org/10.1016/j.acha.2006.04.006), a
+nonlinear spectral reduction with an adaptive-distance kernel over the full
+hidden vectors. Overlapping frames align the two or three axes between windows to
+reduce arbitrary rotations/reflections. Windows are centered and scaled for
+display; axes have no fixed semantic meaning, and distances between different
+windows are not directly comparable. The plot is a local view of model state.
+
+A dedicated CPU process runs projection, with one native BLAS thread and at
+most one job in flight. Inference never waits for a projection result; the next
+job always uses the newest window. On startup, the worker benchmarks 20 and 50
+frames at the loaded model's hidden dimension. It recommends 50 if its p95
+projection time fits within half a model frame, otherwise 20, and caps updates
+at 5 Hz. Manual window selection overrides that recommendation. Hover the
+view heading for calibration, or its timing readout for live worker latency.
+
+Local tests with Moshiko 7B, 4096-dimensional states and an RTX 3090 measured:
+
+| Window | Approximate history | Live projection p95 |
+| --- | --- | --- |
+| 20 frames | 1.6 s | 0.8 ms |
+| 50 frames | 4 s | 1.6–1.7 ms |
+
+The 50-frame worker measured about 3 ms p95 including queue transfer. A local
+120-frame silence test averaged 35.8 ms per complete frame with telemetry,
+within the 80 ms real-time frame budget; the earlier baseline averaged 35.2 ms.
+These are local timings, not guarantees for another machine or network.
+The default is therefore **50 frames at up to 5 Hz**. To repeat the standalone
+projection calibration with representative correlated vectors:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 .venv/bin/python - <<'PY'
+from moshi.projection import benchmark_projection
+print(benchmark_projection(4096, repeats=60))
+PY
+```
+
+Implementation: [`moshi/moshi/telemetry.py`](moshi/moshi/telemetry.py),
+[`moshi/moshi/projection.py`](moshi/moshi/projection.py), and the sampling
+instrumentation in [`moshi/moshi/utils/sampling.py`](moshi/moshi/utils/sampling.py).
+
 ## Organisation of the repository
 
 There are three separate versions of the Moshi inference stack in this repo.

@@ -15,6 +15,8 @@ import { decodeMessage, encodeMessage } from "../../protocol/encoder";
 import { WSMessage } from "../../protocol/types";
 import { AudioScope } from "./AudioScope";
 import { EnvelopeXYScope } from "./EnvelopeXYScope";
+import { LatentScope } from "./LatentScope";
+import { LatentTrajectory, RuntimeMeasurement, TelemetryFeed, TelemetryStatus } from "./RuntimeTelemetry";
 import { PhaseClock } from "./PhaseClock";
 import { PhaseIndicator } from "./PhaseIndicator";
 
@@ -248,6 +250,7 @@ export const Studio: FC = () => {
   const [params, setParams] = useState<SamplingParams>(loadParams);
   const [padTokenId, setPadTokenId] = useState(3);
   const [transcript, setTranscript] = useState("");
+  const [monologueCompact, setMonologueCompact] = useState(true);
   const [elapsed, setElapsed] = useState(0);
   const [inputAnalyser, setInputAnalyser] = useState<AnalyserNode | null>(null);
   const [outputAnalyser, setOutputAnalyser] = useState<AnalyserNode | null>(null);
@@ -271,9 +274,13 @@ export const Studio: FC = () => {
   const [perturbationStatus, setPerturbationStatus] = useState<PerturbationStatus | null>(null);
   const phaseClock = useMemo(() => new PhaseClock(), []);
   const phaseResetPendingRef = useRef(false);
+  const telemetryFeed = useMemo<TelemetryFeed>(() => ({ history: [], trajectory: null }), []);
+  const [telemetryStatus, setTelemetryStatus] = useState<TelemetryStatus | null>(null);
 
   const socketRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const engineStoppedRef = useRef(false);
+  const engineEpochRef = useRef(0);
   const inputBusRef = useRef<GainNode | null>(null);
   const silenceClockRef = useRef<ConstantSourceNode | null>(null);
   const inputMonitorGainRef = useRef<GainNode | null>(null);
@@ -293,6 +300,7 @@ export const Studio: FC = () => {
   const playbackRateRef = useRef(playbackRate);
   const nextPlaybackRef = useRef(0);
   const scheduledSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const sampleSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const sessionStartRef = useRef(Date.now());
   const transcriptRef = useRef<HTMLDivElement>(null);
   const paramsRef = useRef(params);
@@ -567,7 +575,7 @@ export const Studio: FC = () => {
     });
     decoder.onmessage = (event: MessageEvent<Float32Array[]>) => {
       const samples = event.data?.[0];
-      if (!samples?.length || !outputDetectorRef.current || context.state !== "running") return;
+      if (engineStoppedRef.current || !samples?.length || !outputDetectorRef.current || context.state !== "running") return;
       const buffer = context.createBuffer(1, samples.length, context.sampleRate);
       buffer.copyToChannel(samples, 0);
       const source = context.createBufferSource();
@@ -615,6 +623,9 @@ export const Studio: FC = () => {
   const connect = useCallback(() => {
     socketRef.current?.close();
     setConnection("connecting");
+    telemetryFeed.history = [];
+    telemetryFeed.trajectory = null;
+    setTelemetryStatus(null);
     setPerturbationStatus(null);
     phaseClock.reset(0, performance.now());
     phaseResetPendingRef.current = false;
@@ -632,12 +643,33 @@ export const Studio: FC = () => {
         sendSamplingParams(paramsRef.current);
         sendPerturbation(perturbationRef.current);
       } else if (message.type === "audio") {
+        if (engineStoppedRef.current) return;
         const data = message.data;
         decoderRef.current?.postMessage({ command: "decode", pages: data }, [data.buffer]);
       } else if (message.type === "text" || message.type === "coloredtext") {
+        if (engineStoppedRef.current) return;
         setTranscript((current) => current + message.data);
       } else if (message.type === "metadata") {
         const metadata = message.data;
+        if (typeof metadata === "object" && metadata !== null) {
+          if ("trajectory_reset" in metadata && metadata.trajectory_reset === true) {
+            telemetryFeed.trajectory = null;
+            if ("stream_reset" in metadata && metadata.stream_reset === true) telemetryFeed.history = [];
+          }
+          if ("telemetry_status" in metadata && typeof metadata.telemetry_status === "object" && metadata.telemetry_status !== null) {
+            setTelemetryStatus(metadata.telemetry_status as TelemetryStatus);
+          }
+          if (!engineStoppedRef.current && "runtime_measurements" in metadata && typeof metadata.runtime_measurements === "object" && metadata.runtime_measurements !== null) {
+            const sample = metadata.runtime_measurements as RuntimeMeasurement;
+            if (Number.isFinite(sample.text_bits) && Number.isFinite(sample.audio_mean_bits)) {
+              telemetryFeed.history.push(sample);
+              if (telemetryFeed.history.length > 100) telemetryFeed.history.shift();
+            }
+          }
+          if (!engineStoppedRef.current && "trajectory" in metadata && typeof metadata.trajectory === "object" && metadata.trajectory !== null) {
+            telemetryFeed.trajectory = metadata.trajectory as LatentTrajectory;
+          }
+        }
         if (
           typeof metadata === "object"
           && metadata !== null
@@ -662,6 +694,7 @@ export const Studio: FC = () => {
         }
         if (
           typeof metadata === "object" && metadata !== null
+          && !engineStoppedRef.current
           && "perturbation_phase" in metadata
           && typeof metadata.perturbation_phase === "number"
           && Number.isFinite(metadata.perturbation_phase)
@@ -697,7 +730,7 @@ export const Studio: FC = () => {
       setConnection("offline");
       setStatusMessage("Could not reach model");
     };
-  }, [phaseClock, sendPerturbation, sendSamplingParams]);
+  }, [phaseClock, sendPerturbation, sendSamplingParams, telemetryFeed]);
   connectRef.current = connect;
 
   useEffect(() => {
@@ -885,36 +918,51 @@ export const Studio: FC = () => {
   }, [inputAnalyser]);
 
   const enableAudio = useCallback(async () => {
+    const epoch = engineEpochRef.current;
     const context = ensureAudioGraph();
     await context.resume();
+    if (epoch !== engineEpochRef.current) {
+      await context.suspend();
+      return false;
+    }
+    engineStoppedRef.current = false;
     setAudioEnabled(context.state === "running");
+    return context.state === "running";
   }, [ensureAudioGraph]);
 
   const stopRecorder = useCallback(() => {
     if (recorderRef.current) {
-      recorderRef.current.stop();
+      const recorder = recorderRef.current;
       recorderRef.current = null;
+      recorder.stop();
     }
   }, []);
 
   const startRecorder = useCallback(async () => {
+    const epoch = engineEpochRef.current;
     const context = ensureAudioGraph();
-    await context.resume();
-    setAudioEnabled(true);
-    if (recorderRef.current || !inputBusRef.current) return;
+    if (!await enableAudio()) return false;
+    if (recorderRef.current) return true;
+    if (!inputBusRef.current) return false;
     const recorder = new Recorder({
       ...RECORDER_OPTIONS,
       sourceNode: inputBusRef.current,
       bufferLength: Math.round((960 * context.sampleRate) / 24000),
     });
     recorder.ondataavailable = (data: Uint8Array) => {
+      if (engineStoppedRef.current || epoch !== engineEpochRef.current || recorderRef.current !== recorder) return;
       send({ type: "audio", data });
     };
-    recorder.onstart = () => setSourceActive(true);
-    recorder.onstop = () => setSourceActive(false);
+    recorder.onstart = () => { if (recorderRef.current === recorder) setSourceActive(true); };
+    recorder.onstop = () => { if (recorderRef.current === recorder) setSourceActive(false); };
     recorderRef.current = recorder;
     await recorder.start();
-  }, [ensureAudioGraph, send]);
+    if (epoch !== engineEpochRef.current || recorderRef.current !== recorder) {
+      recorder.stop();
+      return false;
+    }
+    return true;
+  }, [enableAudio, ensureAudioGraph, send]);
 
   const stopInput = useCallback(() => {
     if (loopTimerRef.current) {
@@ -928,17 +976,37 @@ export const Studio: FC = () => {
     setSourceActive(false);
   }, [stopRecorder]);
 
+  const stopEngine = useCallback(() => {
+    engineStoppedRef.current = true;
+    engineEpochRef.current += 1;
+    soundPadRequestRef.current += 1;
+    setLoadingPadId("");
+    stopInput();
+    for (const sources of [sampleSourcesRef.current, scheduledSourcesRef.current]) {
+      sources.forEach((source) => {
+        try { source.stop(); } catch { /* Already-ended sources need no cleanup. */ }
+      });
+      sources.clear();
+    }
+    nextPlaybackRef.current = audioContextRef.current?.currentTime ?? 0;
+    if (audioContextRef.current?.state === "running") void audioContextRef.current.suspend();
+    setAudioEnabled(false);
+    setStatusMessage("Engine stopped · trigger a pad or start input to resume");
+  }, [stopInput]);
+
   const triggerSample = useCallback(async (scheduledTime?: number) => {
     const context = ensureAudioGraph();
     if (!sampleBufferRef.current || !inputBusRef.current) {
       setStatusMessage("Load an audio sample first");
       return;
     }
-    await startRecorder();
+    if (!await startRecorder()) return;
     const source = context.createBufferSource();
     source.buffer = sampleBufferRef.current;
     source.playbackRate.value = playbackRateRef.current;
     source.connect(inputBusRef.current);
+    sampleSourcesRef.current.add(source);
+    source.onended = () => sampleSourcesRef.current.delete(source);
     source.start(Math.max(context.currentTime, scheduledTime ?? context.currentTime));
   }, [ensureAudioGraph, startRecorder]);
 
@@ -991,7 +1059,7 @@ export const Studio: FC = () => {
 
   useEffect(() => {
     const handleSoundPadKeyDown = (event: KeyboardEvent) => {
-      if (event.repeat || event.altKey || event.ctrlKey || event.metaKey) return;
+      if (event.altKey || event.ctrlKey || event.metaKey || event.isComposing) return;
       const target = event.target;
       if (
         target instanceof HTMLInputElement
@@ -1001,6 +1069,12 @@ export const Studio: FC = () => {
       ) {
         return;
       }
+      if (event.code === "Space" || event.key === " ") {
+        event.preventDefault();
+        if (!event.repeat) stopEngine();
+        return;
+      }
+      if (event.repeat) return;
       const padIndex = event.key === "0" ? 9 : Number(event.key) - 1;
       if (!Number.isInteger(padIndex) || padIndex < 0 || padIndex >= SOUND_PADS.length) return;
       event.preventDefault();
@@ -1008,7 +1082,7 @@ export const Studio: FC = () => {
     };
     window.addEventListener("keydown", handleSoundPadKeyDown);
     return () => window.removeEventListener("keydown", handleSoundPadKeyDown);
-  }, [selectSoundPad]);
+  }, [selectSoundPad, stopEngine]);
 
   useEffect(() => {
     if (!looping) return;
@@ -1055,7 +1129,7 @@ export const Studio: FC = () => {
       setStatusMessage("Load an audio sample first");
       return;
     }
-    await enableAudio();
+    if (!await enableAudio()) return;
     setLooping((current) => !current);
   }, [enableAudio]);
 
@@ -1081,14 +1155,19 @@ export const Studio: FC = () => {
       return;
     }
     stopInput();
+    const epoch = engineEpochRef.current;
     setInputMode(mode);
     try {
-      await enableAudio();
+      if (!await enableAudio()) return;
       const stream = mode === "microphone"
         ? await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         })
         : await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      if (epoch !== engineEpochRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
       if (!stream.getAudioTracks().length) {
         stream.getTracks().forEach((track) => track.stop());
         throw new Error("No audio track was shared");
@@ -1098,7 +1177,7 @@ export const Studio: FC = () => {
       const context = ensureAudioGraph();
       const source = context.createMediaStreamSource(stream);
       source.connect(inputBusRef.current!);
-      await startRecorder();
+      if (!await startRecorder()) return;
       setStatusMessage(mode === "microphone" ? "Microphone feeding Moshi" : "System audio feeding Moshi");
     } catch (error) {
       setSourceActive(false);
@@ -1205,10 +1284,10 @@ export const Studio: FC = () => {
     void beginMidiLearn("voice-pad-0");
   };
 
-  // Past lines above, present line below; repeated sentences are marked in pencil.
+  // Recent large text; repeated sentences are marked in pencil.
   const monologue = useMemo(() => {
     const clean = transcript.replace(/\s+/g, " ").trim();
-    if (!clean) return { history: [] as string[], current: [] as { text: string; repeated: boolean }[] };
+    if (!clean) return { current: [] as { text: string; repeated: boolean }[] };
     const sentences = clean.match(/[^.!?…]+[.!?…]+|[^.!?…]+$/g)?.map((part) => part.trim()).filter(Boolean) ?? [clean];
     const clip = (text: string, size: number) => (text.length > size ? `…${text.slice(-size)}` : text);
     const current: string[] = [];
@@ -1220,14 +1299,10 @@ export const Studio: FC = () => {
       budget -= sentence.length;
       if (budget <= 0) break;
     }
-    const history = sentences
-      .slice(Math.max(0, sentences.length - current.length - HISTORY_LINES), sentences.length - current.length)
-      .map((sentence) => clip(sentence, 72));
     const normalize = (text: string) => text.toLocaleLowerCase().normalize("NFKC").replace(/[^\p{L}\p{N}]+/gu, "");
     const counts = new Map<string, number>();
     current.forEach((text) => counts.set(normalize(text), (counts.get(normalize(text)) ?? 0) + 1));
     return {
-      history,
       current: current.map((text) => ({ text, repeated: (counts.get(normalize(text)) ?? 0) > 1 })),
     };
   }, [transcript]);
@@ -1308,6 +1383,10 @@ export const Studio: FC = () => {
             <span title="Códec">MIMI 24K</span>
           </div>
           <div className="header-actions">
+            <button type="button" className="key key-small" onClick={stopEngine}
+              aria-label="Detener motor" aria-keyshortcuts="Space" title="Detener motor (Espacio)">
+              <Icon d={ICONS.stop} size={18} />
+            </button>
             <div className="midi-monitor">
               <button
                 type="button"
@@ -1489,7 +1568,7 @@ export const Studio: FC = () => {
           </div>
         </section>
 
-        <section className="cell monologue-cell" aria-label="Monólogo interior de Moshi">
+        <section className={`cell monologue-cell ${monologueCompact ? "monologue-compact" : ""}`} aria-label="Monólogo interior de Moshi">
           <div className="scopes">
             <div className="scope" title={`Entrada · nivel ${inputLevel}%`}>
               <AudioScope analyser={inputAnalyser} variant="input" label="Entrada, canal izquierdo" />
@@ -1501,9 +1580,19 @@ export const Studio: FC = () => {
             </div>
           </div>
 
+          <LatentScope feed={telemetryFeed} status={telemetryStatus} live={connection === "live"}
+            onChange={(settings) => send({ type: "metadata", data: { telemetry: settings } })} />
+
           <div className="monologue">
             <div className="monologue-head">
               <span>&gt; INNER_MONOLOGUE</span>
+              <div className="monologue-actions">
+                <button type="button" className="key key-small" aria-expanded={!monologueCompact}
+                  aria-label={monologueCompact ? "Ampliar monólogo" : "Reducir monólogo a dos líneas"}
+                  title={monologueCompact ? "Ampliar monólogo" : "Reducir monólogo a dos líneas"}
+                  onClick={() => setMonologueCompact((value) => !value)}>
+                  {monologueCompact ? "+" : "−"}
+                </button>
               <button
                 type="button"
                 className="key key-small"
@@ -1514,18 +1603,14 @@ export const Studio: FC = () => {
               >
                 <Icon d={ICONS.backspace} size={18} />
               </button>
+              </div>
             </div>
             {monologue.current.length ? (
               <div className={`monologue-body ${draining ? "draining" : ""}`} ref={transcriptRef}>
-                <div className="monologue-history">
-                  {monologue.history.map((line, index) => (
-                    <span key={`${index}-${line}`}>› {line}</span>
-                  ))}
-                </div>
                 <p className="monologue-current" aria-live="polite">
                   {monologue.current.map((segment, index) => (
                     <span key={`${index}-${segment.text}`} className={segment.repeated ? "repeated" : undefined}>
-                      {segment.text}
+                      {index > 0 ? " " : ""}{segment.text}
                     </span>
                   ))}
                   <i className="cursor" aria-hidden="true" />
@@ -1802,7 +1887,6 @@ export const Studio: FC = () => {
 
 const MODEL_NAME = "moshiko-7b";
 const CURRENT_LINE_BUDGET = 72;
-const HISTORY_LINES = 4;
 const RASTER_WINDOW_SECONDS = 15;
 
 const ICONS = {

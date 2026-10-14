@@ -1,4 +1,4 @@
-import { FC, useEffect, useId, useRef } from "react";
+import { FC, useEffect, useRef } from "react";
 
 const INK = "rgba(35, 34, 31, ALPHA)";
 
@@ -24,19 +24,12 @@ function normalizeEnvelope(rms: number) {
   return Math.min(1, Math.log1p(rms * 40) / Math.log(5));
 }
 
-const PARALLELS = [32, 68, 110, 152, 188];
-const MERIDIAN_DELAYS = [0, -3.5, -7, -10.5];
-
-/**
- * Input envelope (x) against Moshi envelope (y), drawn over a wire-frame globe
- * that turns frame by frame, as in the Röhner page with the sphere.
- */
+/** Input/output envelopes as an ink-only XY trace. */
 export const EnvelopeXYScope: FC<EnvelopeXYScopeProps> = ({
   inputAnalyser,
   outputAnalyser,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const clipId = `xy-globe-${useId().replace(/:/g, "")}`;
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -116,34 +109,7 @@ export const EnvelopeXYScope: FC<EnvelopeXYScopeProps> = ({
   }, [inputAnalyser, outputAnalyser]);
 
   return (
-    <div className="xy-globe">
-      <svg viewBox="0 0 220 220" aria-hidden="true">
-        <defs>
-          <clipPath id={clipId}>
-            <circle cx="110" cy="110" r="104" />
-          </clipPath>
-        </defs>
-        <circle cx="110" cy="110" r="106" className="xy-globe-disc" />
-        <g clipPath={`url(#${clipId})`}>
-          <g transform="rotate(-16 110 110)">
-            {MERIDIAN_DELAYS.map((delay) => (
-              <ellipse
-                key={delay}
-                className="xy-globe-meridian"
-                cx="110"
-                cy="110"
-                rx="104"
-                ry="104"
-                style={{ animationDelay: `${delay}s` }}
-              />
-            ))}
-            {PARALLELS.map((y) => (
-              <line key={y} className="xy-globe-line" x1="0" y1={y} x2="220" y2={y} />
-            ))}
-          </g>
-        </g>
-        <circle cx="110" cy="110" r="106" className="xy-globe-rim" />
-      </svg>
+    <div className="xy-scope">
       <canvas ref={canvasRef} aria-label="Envolvente de entrada contra envolvente de Moshi" />
       <span className="xy-tag xy-tag-out">OUT</span>
       <span className="xy-tag xy-tag-in">IN</span>

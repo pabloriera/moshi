@@ -572,6 +572,7 @@ class LMGen(StreamingModule[_LMGenState]):
         support_out_of_sync: bool = False,
         cfg_is_masked_until: list[int] | None = None,
         cfg_is_no_text: bool = False,
+        measure_entropy: bool = False,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -599,6 +600,12 @@ class LMGen(StreamingModule[_LMGenState]):
         self.support_out_of_sync = support_out_of_sync
         self.cfg_is_masked_until = cfg_is_masked_until
         self.cfg_is_no_text = cfg_is_no_text
+        # Text followed by each generated audio codebook, in sampling order.
+        # Allocate before CUDA capture; depth replay updates these in place.
+        self.sampling_entropy = (
+            torch.zeros(lm_model.dep_q + 1, device=lm_model.device)
+            if measure_entropy else None
+        )
         if self.cfg_coef != 1.:
             if not self.cfg_is_no_text and not self.cfg_is_masked_until:
                 assert self.lm_model.fuser is not None, "Model has no fuser, cannot do CFG."
@@ -742,6 +749,7 @@ class LMGen(StreamingModule[_LMGenState]):
             self.top_k_text,
             bias_token_id=lm_model.text_padding_token_id,
             bias=self.pad_mult,
+            entropy_out=self.sampling_entropy[:1] if self.sampling_entropy is not None else None,
         )
         assert text_token.dim() == 3, text_token.shape
         assert text_token.shape[2] == 1
@@ -839,6 +847,8 @@ class LMGen(StreamingModule[_LMGenState]):
                     self.use_sampling,
                     self.temp,
                     self.top_k,
+                    entropy_out=(self.sampling_entropy[cb_index + 1:cb_index + 2]
+                                 if self.sampling_entropy is not None else None),
                 )
                 assert next_token.shape == (B, 1, 1)
                 next_token = next_token[:, 0, 0]  # shape is B
